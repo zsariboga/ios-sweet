@@ -1,0 +1,142 @@
+diff --git a/iokit/Kernel/arm/SweetAccel.cpp b/iokit/Kernel/arm/SweetAccel.cpp
+new file mode 100644
+index 0000000..35a84ae
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAccel.cpp
+@@ -0,0 +1,108 @@
++/*
++ * SWEET: a stub GPU accelerator service.
++ *
++ * OpenGLES (-[EAGLSharegroup loadGLIPlugin]) and Metal (MTLRegisterDevices)
++ * look for IOKit services of class IOAcceleratorES. With none present,
++ * CoreAnimation falls back to its software renderer. This file registers an
++ * empty IOAcceleratorES so we can watch what userland does next: which
++ * process opens it, with which user client type, and which properties it
++ * sets. Every request is logged and refused, so callers still take their
++ * software fallback. This is the first step towards a paravirtual GLES
++ * engine (research/gles-backend-re.md, research/metal-gles-driver-discovery.md).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSSymbol.h>
++
++extern "C" void proc_selfname(char *buf, int size);
++
++#define SWEET_ACCEL_LOG_MAX 400
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++class SweetAccel : public IOAcceleratorES {
++	OSDeclareDefaultStructors(SweetAccel);
++	unsigned fLogged;
++	bool logOK(void);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID,
++	    UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetAccel, IOAcceleratorES);
++
++bool
++SweetAccel::logOK(void)
++{
++	if (fLogged >= SWEET_ACCEL_LOG_MAX) {
++		return false;
++	}
++	fLogged++;
++	return true;
++}
++
++bool
++SweetAccel::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty("SweetAccel", true);
++	registerService();
++	IOLog("SWEET ACCEL: IOAcceleratorES stub registered\n");
++	return true;
++}
++
++IOReturn
++SweetAccel::newUserClient(task_t owningTask, void *securityID,
++    UInt32 type, IOUserClient **handler)
++{
++	char name[32];
++
++	if (logOK()) {
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET ACCEL: newUserClient type %u from %s (refused)\n",
++		    (unsigned)type, name);
++	}
++	(void)owningTask;
++	(void)securityID;
++	(void)handler;
++	return kIOReturnUnsupported;
++}
++
++IOReturn
++SweetAccel::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSCollectionIterator *it;
++	OSSymbol *key;
++	char name[32];
++
++	if (dict == NULL || !logOK()) {
++		return kIOReturnSuccess;
++	}
++	proc_selfname(name, sizeof(name));
++	it = OSCollectionIterator::withCollection(dict);
++	if (it == NULL) {
++		return kIOReturnSuccess;
++	}
++	while ((key = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++		IOLog("SWEET ACCEL: setProperties %s from %s\n",
++		    key->getCStringNoCopy(), name);
++	}
++	it->release();
++	return kIOReturnSuccess;
++}
++#endif /* SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..b8e1ae3 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetAccel;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetAccel;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 2627727..fe5d788 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetNet.cpp                                 optional iokitcpp
++iokit/Kernel/arm/SweetAccel.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
