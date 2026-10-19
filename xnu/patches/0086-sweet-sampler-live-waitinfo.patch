@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
-index eca93ed..648bda1 100644
+index eca93ed..241bfcf 100644
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
-@@ -10,7 +10,14 @@
+@@ -10,7 +10,20 @@
   * with tools/sweet-crash.py). A thread blocked in a syscall shows the
   * syscall stub in pc and its caller in lr/bt.
   *
@@ -12,17 +12,34 @@ index eca93ed..648bda1 100644
 + * First sample sweetsample_first s after start (90), then every
 + * sweetsample_iv s (120), sweetsample_n samples (40, 0 = no limit).
 + *
-+ * Live: the host (QEMU gdbstub, tools/sweetctl.py) writes process names to
-+ * sweet_sample_now; within a second they are sampled once (same syntax, also
-+ * when the periodic sampler is off) and the buffer is cleared.
++ * Live: the host (QEMU gdbstub, sweetmon.py sample.req) writes process names
++ * to sweet_sample_now; within a second they are sampled once (same syntax,
++ * also when the periodic sampler is off) and the buffer is cleared.
++ *
++ * Host input (QEMU has no keys or touch panel): the host writes events into
++ * sweet_input.ev[seq % 16] and then advances sweet_input.seq (one gdbstub
++ * write with the VM stopped); a kernel thread polls every 10 ms and feeds
++ * them to the SweetHID services. {1, key, down}: key 0 power, 1 vol+,
++ * 2 vol-, 3 home. {2, finger, down, x, y}: touch in 1080x2400 panel pixels.
   */
  #include <sys/param.h>
  #include <sys/systm.h>
-@@ -25,12 +32,13 @@ extern int hz;
+@@ -25,12 +38,24 @@ extern int hz;
  extern void sweet_sample_start(void);
  
  static char sweet_sample_names[128];
 +char sweet_sample_now[128];     /* written by the host, see above */
++
++#define SWEET_INPUT_SLOTS 16
++struct sweet_input {
++	volatile uint32_t seq;          /* events written by the host */
++	volatile uint32_t done;         /* events consumed by the kernel */
++	int32_t ev[SWEET_INPUT_SLOTS][5];
++};
++struct sweet_input sweet_input;  /* written by the host, see above */
++
++extern void sweet_hid_key(int key, int down);                   /* SweetHID.cpp */
++extern void sweet_hid_touch(int finger, int down, int x, int y);
  
  static bool
 -sweet_sample_wanted(const char *name)
@@ -34,7 +51,7 @@ index eca93ed..648bda1 100644
  		const char *end = strchr(t, ',');
  		size_t tl = end ? (size_t)(end - t) : strlen(t);
  		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
-@@ -44,17 +52,19 @@ sweet_sample_wanted(const char *name)
+@@ -44,17 +69,19 @@ sweet_sample_wanted(const char *name)
  	return false;
  }
  
@@ -58,7 +75,7 @@ index eca93ed..648bda1 100644
  		}
  	}
  	return PROC_RETURNED;
-@@ -64,17 +74,37 @@ static void
+@@ -64,17 +91,58 @@ static void
  sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	static int chan;
@@ -73,12 +90,6 @@ index eca93ed..648bda1 100644
  	}
 -	if (sweet_sample_names[0] == '-') {
 -		return;
--	}
--	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
--	for (int i = 0; i < 40; i++) {
--		printf("SMP --- sample %d\n", i);
--		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
--		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
 +	PE_parse_boot_argn("sweetsample_first", &first, sizeof(first));
 +	PE_parse_boot_argn("sweetsample_iv", &iv, sizeof(iv));
 +	PE_parse_boot_argn("sweetsample_n", &count, sizeof(count));
@@ -102,8 +113,42 @@ index eca93ed..648bda1 100644
 +			next = t + (iv > 0 ? iv : 1);
 +		}
  	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+-	for (int i = 0; i < 40; i++) {
+-		printf("SMP --- sample %d\n", i);
+-		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++}
++
++static void
++sweet_input_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	int ticks = hz / 100 > 0 ? hz / 100 : 1;
++
++	for (;;) {
++		(void)tsleep(&chan, PZERO, "sweetinp", ticks);
++		while (sweet_input.done != sweet_input.seq) {
++			int32_t *e = sweet_input.ev[sweet_input.done % SWEET_INPUT_SLOTS];
++			if (e[0] == 1) {
++				printf("SWEET INPUT: key %d %s\n", e[1], e[2] ? "down" : "up");
++				sweet_hid_key(e[1], e[2]);
++			} else if (e[0] == 2) {
++				sweet_hid_touch(e[1], e[2], e[3], e[4]);
++			}
++			sweet_input.done++;
++		}
+ 	}
  }
  
+@@ -91,4 +159,7 @@ sweet_sample_start(void)
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (kernel_thread_start(sweet_input_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
 index a20a764..5fcde23 100644
 --- a/osfmk/kern/exception.c
