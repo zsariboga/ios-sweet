@@ -1,0 +1,18 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -73,10 +73,13 @@
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	/*
++	 * MPIDR layout: sweet = Aff1 (core << 8), QEMU virt = Aff0 (core).
++	 * Accept either, but not a mix of both in one MPIDR.
++	 */
++	if (cpu->phys_id > 0x707 ||
++	    ((cpu->phys_id & 0xff) != 0 && (cpu->phys_id >> 8) != 0) ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
