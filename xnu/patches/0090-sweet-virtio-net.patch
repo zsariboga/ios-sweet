@@ -604,9 +604,10 @@ new file mode 100644
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/iokit/Kernel/arm/SweetNet.cpp b/iokit/Kernel/arm/SweetNet.cpp
 new file mode 100644
+index 0000000..81482a8
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetNet.cpp
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,90 @@
 +/*
 + * SWEET: the IOKit side of the network interface.
 + *
@@ -657,6 +658,7 @@ new file mode 100644
 +	IONetworkInterface *ifp = OSTypeAlloc(IONetworkInterface);
 +	OSDictionary *match;
 +	IOService *parent;
++	bool attached;
 +
 +	if (ifp == NULL) {
 +		return;
@@ -666,11 +668,19 @@ new file mode 100644
 +		return;
 +	}
 +	match = IOService::serviceMatching("IOResources");
-+	parent = match ? IOService::match(match) : NULL;
++	/* copyMatchingService() does not consume "match" and returns a
++	 * retained parent, which is released once ifp holds its own link. */
++	parent = match ? IOService::copyMatchingService(match) : NULL;
 +	if (match != NULL) {
 +		match->release();
 +	}
-+	if (parent == NULL || !ifp->attach(parent)) {
++	if (parent == NULL) {
++		ifp->release();
++		return;
++	}
++	attached = ifp->attach(parent);
++	parent->release();
++	if (!attached) {
 +		ifp->release();
 +		return;
 +	}
