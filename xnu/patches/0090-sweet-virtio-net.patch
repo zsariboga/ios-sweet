@@ -1,0 +1,685 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -2,6 +2,7 @@
+  bsd/dev/sweet_rpmh.c			standard
+  bsd/dev/sweet_spmi.c			standard
+  bsd/dev/sweet_usb.c			standard
+++bsd/dev/sweet_virtio_net.c		standard
+  bsd/dev/mem.c				standard
+  bsd/dev/munge.c 			optional config_requires_u32_munging
+  bsd/dev/unix_startup.c			standard
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -26,6 +26,7 @@
+  iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+  iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+  iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+++iokit/Kernel/arm/SweetNet.cpp                                 optional iokitcpp
+  iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+  iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+  iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_virtio_net_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_virtio_net_probe();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_virtio_net.c b/bsd/dev/sweet_virtio_net.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_virtio_net.c
+@@ -0,0 +1,558 @@
++/*
++ * SWEET: virtio-net (QEMU virt, virtio-mmio) as an Ethernet interface.
++ *
++ * The iOS userland only sees interfaces that also exist in IOKit as
++ * IONetworkInterface services (configd / SystemConfiguration enumerate them
++ * with SCNetworkInterfaceCopyAll), so this driver publishes the BSD
++ * interface (en0) and calls the IOKit stub (iokit/Kernel/arm/SweetNet.cpp)
++ * that registers the matching IONetworkInterface service.
++ *
++ * The device is polled, not interrupt driven: the guest is a phone emulator
++ * and the network carries the usual background traffic (DHCP, NTP, app data).
++ *
++ * QEMU: -netdev user,id=n0 -device virtio-net-device,netdev=n0,mac=52:54:00:12:34:56
++ * Boot-arg sweetnet=0 disables the driver.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <kern/locks.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <netinet/in.h>
++#include <net/if_media.h>
++#include <net/dlil.h>
++#include <sys/kern_event.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern void sweet_netif_publish(const uint8_t *mac, const char *bsdname, int unit);
++
++/* virtio-mmio transport (QEMU virt): 32 transports at 0x0a000000 + 0x200 * n. */
++#define VN_MMIO_BASE       0x0a000000ULL
++#define VN_MMIO_STRIDE     0x200
++#define VN_MMIO_MAX        32
++#define VN_ID_NET          1
++#define VN_MAGIC           0x74726976u
++
++/* Registers (virtio-mmio, version 2). */
++#define VN_REG_MAGIC       0x000
++#define VN_REG_VERSION     0x004
++#define VN_REG_DEVICE_ID   0x008
++#define VN_REG_VENDOR_ID   0x00c
++#define VN_REG_FEATURES    0x010
++#define VN_REG_FEATURES_SEL 0x014
++#define VN_REG_QUEUE_SEL   0x018
++#define VN_REG_QUEUE_NUM_MAX 0x01c
++#define VN_REG_QUEUE_NUM   0x020
++#define VN_REG_QUEUE_READY 0x024
++#define VN_REG_QUEUE_NOTIFY 0x028
++#define VN_REG_STATUS      0x070
++#define VN_REG_QUEUE_DESC_LOW 0x080
++#define VN_REG_QUEUE_DESC_HIGH 0x084
++#define VN_REG_QUEUE_DRV_LOW 0x090
++#define VN_REG_QUEUE_DRV_HIGH 0x094
++#define VN_REG_QUEUE_DEV_LOW 0x0a0
++#define VN_REG_QUEUE_DEV_HIGH 0x0a4
++
++#define VN_STATUS_ACK      1
++#define VN_STATUS_DRIVER   2
++#define VN_STATUS_DRIVER_OK 4
++#define VN_STATUS_FEATURES_OK 8
++
++/* Feature bits (32-bit words; VERSION_1 is bit 32). */
++#define VN_NET_F_MAC       5
++#define VN_F_VERSION_1     32
++
++#define VN_QUEUE_RX        0
++#define VN_QUEUE_TX        1
++#define VN_QSIZE           64
++#define VN_RX_BUFS         32
++#define VN_BUF_SIZE        2048
++#define VN_HDR_SIZE        10              /* virtio_net_hdr without MRG_RXBUF */
++
++#define VN_DESC_F_NEXT     1
++#define VN_DESC_F_WRITE    2
++
++/* DMA layout inside one contiguous block. */
++#define VN_OFF_RX_DESC     0x00000
++#define VN_OFF_TX_DESC     0x01000
++#define VN_OFF_RX_AVAIL    0x02000
++#define VN_OFF_RX_USED     0x03000
++#define VN_OFF_TX_AVAIL    0x04000
++#define VN_OFF_TX_USED     0x05000
++#define VN_OFF_RX_BUF      0x06000
++#define VN_OFF_TX_BUF      0x16000
++#define VN_DMA_SIZE        0x40000
++
++struct vn_desc {
++	uint64_t addr;
++	uint32_t len;
++	uint16_t flags;
++	uint16_t next;
++};
++
++struct vn_avail {
++	volatile uint16_t flags;
++	volatile uint16_t idx;
++	volatile uint16_t ring[VN_QSIZE];
++	volatile uint16_t used_event;
++};
++
++struct vn_used_elem {
++	uint32_t id;
++	uint32_t len;
++};
++
++struct vn_used {
++	volatile uint16_t flags;
++	volatile uint16_t idx;
++	volatile struct vn_used_elem ring[VN_QSIZE];
++	volatile uint16_t avail_event;
++};
++
++static struct {
++	vm_offset_t regs;                 /* kernel mapping of the MMIO block */
++	uint64_t    dma_pa;               /* physical address of the DMA block */
++	uint8_t    *dma;                  /* kernel mapping of the DMA block */
++	struct vn_desc *rx_desc;
++	struct vn_desc *tx_desc;
++	struct vn_avail *rx_avail;
++	struct vn_used  *rx_used;
++	struct vn_avail *tx_avail;
++	struct vn_used  *tx_used;
++	uint8_t    *rx_buf;
++	uint8_t    *tx_buf;
++	uint16_t    rx_next;              /* next descriptor to post */
++	uint16_t    rx_seen;              /* used ring index consumed so far */
++	uint16_t    tx_next;
++	uint16_t    tx_seen;
++	uint8_t     mac[6];
++	uint16_t    mtu;
++	ifnet_t     ifp;
++	lck_mtx_t  *lock;
++	thread_t    thread;
++	bool        up;
++	uint64_t    rx_frames, tx_frames, tx_dropped;
++} vn;
++
++static inline uint32_t
++vn_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)((vm_offset_t)vn.regs + off);
++}
++
++static inline void
++vn_wr(uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)((vm_offset_t)vn.regs + off) = val;
++}
++
++/* The DMA block is normal memory: clean it before the device reads it. */
++static inline void
++vn_clean(uint64_t pa, uint32_t len)
++{
++	flush_dcache64((addr64_t)pa, len, TRUE);
++}
++
++/* The device wrote into the buffer: drop our cached copy. */
++static inline void
++vn_inv(uint64_t pa, uint32_t len)
++{
++	flush_dcache64((addr64_t)pa, len, FALSE);
++}
++
++static errno_t
++vn_if_output(ifnet_t ifp, mbuf_t m)
++{
++	uint32_t len = (uint32_t)mbuf_pkthdr_len(m);
++	uint16_t desc;
++	uint8_t *buf;
++	bool sent = false;
++
++	if (len == 0 || len + VN_HDR_SIZE > VN_BUF_SIZE) {
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++
++	lck_mtx_lock(vn.lock);
++	if (vn.up && (vn.tx_next - vn.tx_seen) < VN_QSIZE) {
++		desc = vn.tx_next % VN_QSIZE;
++		buf = vn.tx_buf + (size_t)desc * VN_BUF_SIZE;
++		bzero(buf, VN_HDR_SIZE);
++		mbuf_copydata(m, 0, len, buf + VN_HDR_SIZE);
++		vn.tx_desc[desc].addr = vn.dma_pa + VN_OFF_TX_BUF + (uint64_t)desc * VN_BUF_SIZE;
++		vn.tx_desc[desc].len = VN_HDR_SIZE + len;
++		vn.tx_desc[desc].flags = 0;
++		vn.tx_desc[desc].next = 0;
++		vn_clean(vn.dma_pa + VN_OFF_TX_DESC + (uint64_t)desc * sizeof(struct vn_desc),
++		    sizeof(struct vn_desc));
++		vn_clean(vn.dma_pa + VN_OFF_TX_BUF + (uint64_t)desc * VN_BUF_SIZE, VN_HDR_SIZE + len);
++		vn.tx_avail->ring[vn.tx_next % VN_QSIZE] = desc;
++		vn.tx_next++;
++		__atomic_thread_fence(__ATOMIC_RELEASE);
++		vn.tx_avail->idx = vn.tx_next;
++		vn_wr(VN_REG_QUEUE_NOTIFY, VN_QUEUE_TX);
++		sent = true;
++		vn.tx_frames++;
++	}
++	lck_mtx_unlock(vn.lock);
++
++	ifnet_stat_increment_out(ifp, 1, len, 0);
++	if (!sent) {
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		vn.tx_dropped++;
++	}
++	return 0;
++}
++
++static void
++vn_link_event(bool up)
++{
++	if (vn.ifp != NULL) {
++		dlil_post_msg(vn.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++	}
++}
++
++static errno_t
++vn_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = (cmd == SIOCGIFMEDIA64) ?
++		    ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int media = IFM_ETHER | IFM_AUTO;
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = vn.up ? (IFM_ETHER | IFM_1000T | IFM_FDX) : media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (vn.up ? IFM_ACTIVE : 0);
++		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
++			ifmr->ifm_count = 1;
++			return copyout(&media, list, sizeof(media));
++		}
++		ifmr->ifm_count = 1;
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++vn_if_detach(ifnet_t ifp __unused)
++{
++}
++
++/* en0: the iOS userland expects "en" interfaces (IOEthernetInterface). */
++static void
++vn_if_create(void)
++{
++	struct ifnet_init_eparams init;
++	static lck_grp_t *grp;
++
++	grp = lck_grp_alloc_init("sweet_virtio_net", LCK_GRP_ATTR_NULL);
++	vn.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "sweet-virtio-net";
++	init.uniqueid_len = sizeof("sweet-virtio-net") - 1;
++	init.name = "en";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = vn_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = vn_if_ioctl;
++	init.detach = vn_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &vn.ifp) != 0) {
++		printf("SWEET NET: ifnet_allocate failed\n");
++		vn.ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(vn.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(vn.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(vn.ifp, vn.mtu ? vn.mtu : ETHERMTU);
++	ifnet_set_baudrate(vn.ifp, 1000000000);
++	ifnet_set_flags(vn.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(vn.ifp, NULL) != 0) {
++		printf("SWEET NET: ifnet_attach failed\n");
++		vn.ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(vn.ifp, vn.mac, ETHER_ADDR_LEN);
++	errno_t err = proto_plumb(PF_INET, vn.ifp);
++	if (err != 0) {
++		printf("SWEET NET: proto_plumb failed (%d)\n", err);
++	}
++	/* The IOKit side: configd only sees interfaces that are registered as
++	 * IONetworkInterface services. */
++	sweet_netif_publish(vn.mac, "en0", 0);
++	ifnet_set_flags(vn.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	vn.up = true;
++	vn_link_event(true);
++	printf("SWEET NET: en0 up (mac %02x:%02x:%02x:%02x:%02x:%02x, mtu %u)\n",
++	    vn.mac[0], vn.mac[1], vn.mac[2], vn.mac[3], vn.mac[4], vn.mac[5],
++	    (unsigned)(vn.mtu ? vn.mtu : ETHERMTU));
++}
++
++/* Hand a received frame to the stack. */
++static void
++vn_rx_frame(uint8_t *data, uint32_t len)
++{
++	mbuf_t m = NULL;
++	struct ifnet_stat_increment_param stats = {};
++
++	if (len < ETHER_HDR_LEN || len > VN_BUF_SIZE) {
++		return;
++	}
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++	    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
++		memcpy(mbuf_data(m), data, len);
++		mbuf_setlen(m, len);
++		mbuf_pkthdr_setlen(m, len);
++		void *frame_header = mbuf_data(m);
++		mbuf_pkthdr_setrcvif(m, vn.ifp);
++		mbuf_pkthdr_setheader(m, frame_header);
++		mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++		(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++		ifnet_input(vn.ifp, m, &stats);
++		vn.rx_frames++;
++		return;
++	}
++	if (m != NULL) {
++		mbuf_freem(m);
++	}
++}
++
++/* Poll the device: take what the device received, give back transmit buffers. */
++static void
++vn_poll(void)
++{
++	uint16_t i;
++
++	lck_mtx_lock(vn.lock);
++	for (;;) {
++		uint16_t used_idx = vn.rx_used->idx;
++		uint32_t id, len;
++
++		if (used_idx == vn.rx_seen) {
++			break;
++		}
++		i = vn.rx_seen % VN_QSIZE;
++		id = vn.rx_used->ring[i].id;
++		len = vn.rx_used->ring[i].len;
++		if (id < VN_RX_BUFS && len <= VN_BUF_SIZE) {
++			vn_inv(vn.dma_pa + VN_OFF_RX_BUF + (uint64_t)id * VN_BUF_SIZE, len);
++			vn_rx_frame(vn.rx_buf + (size_t)id * VN_BUF_SIZE, len);
++		}
++		/* Post the same descriptor again. */
++		vn.rx_desc[id].addr = vn.dma_pa + VN_OFF_RX_BUF + (uint64_t)id * VN_BUF_SIZE;
++		vn.rx_desc[id].len = VN_BUF_SIZE;
++		vn.rx_desc[id].flags = VN_DESC_F_WRITE;
++		vn.rx_desc[id].next = 0;
++		vn_clean(vn.dma_pa + VN_OFF_RX_DESC + (uint64_t)id * sizeof(struct vn_desc),
++		    sizeof(struct vn_desc));
++		vn.rx_avail->ring[vn.rx_next % VN_QSIZE] = (uint16_t)id;
++		vn.rx_next++;
++		__atomic_thread_fence(__ATOMIC_RELEASE);
++		vn.rx_avail->idx = vn.rx_next;
++		vn.rx_seen++;
++	}
++	vn_wr(VN_REG_QUEUE_NOTIFY, VN_QUEUE_RX);
++
++	/* Transmit completions: the buffers are free again. */
++	for (;;) {
++		uint16_t used_idx = vn.tx_used->idx;
++
++		if (used_idx == vn.tx_seen) {
++			break;
++		}
++		vn.tx_seen++;
++	}
++	lck_mtx_unlock(vn.lock);
++}
++
++static void
++vn_thread(void *arg __unused)
++{
++	while (vn.up) {
++		vn_poll();
++		delay(4);           /* 4 ms poll */
++	}
++	printf("SWEET NET: thread stopped\n");
++}
++
++/* Program one split virtqueue. */
++static void
++vn_queue_setup(int q, uint64_t desc_pa, uint64_t avail_pa, uint64_t used_pa)
++{
++	vn_wr(VN_REG_QUEUE_SEL, (uint32_t)q);
++	vn_wr(VN_REG_QUEUE_NUM, VN_QSIZE);
++	vn_wr(VN_REG_QUEUE_DESC_LOW, (uint32_t)(desc_pa & 0xffffffffULL));
++	vn_wr(VN_REG_QUEUE_DESC_HIGH, (uint32_t)(desc_pa >> 32));
++	vn_wr(VN_REG_QUEUE_DRV_LOW, (uint32_t)(avail_pa & 0xffffffffULL));
++	vn_wr(VN_REG_QUEUE_DRV_HIGH, (uint32_t)(avail_pa >> 32));
++	vn_wr(VN_REG_QUEUE_DEV_LOW, (uint32_t)(used_pa & 0xffffffffULL));
++	vn_wr(VN_REG_QUEUE_DEV_HIGH, (uint32_t)(used_pa >> 32));
++	vn_wr(VN_REG_QUEUE_READY, 1);
++}
++
++void
++sweet_virtio_net_probe(void)
++{
++	int enabled = 1;
++	vm_offset_t regs = 0;
++	vm_offset_t dma = 0;
++	uint32_t status, features, features1;
++	ppnum_t pn;
++	uint16_t i;
++
++	PE_parse_boot_argn("sweetnet", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++
++	/* Find the network device on the virtio-mmio bus. */
++	for (unsigned n = 0; n < VN_MMIO_MAX; n++) {
++		vm_offset_t r = ml_io_map(VN_MMIO_BASE + (uint64_t)n * VN_MMIO_STRIDE, VN_MMIO_STRIDE);
++		if (r == 0) {
++			continue;
++		}
++		if (*(volatile uint32_t *)(r + VN_REG_MAGIC) != VN_MAGIC) {
++			continue;
++		}
++		if (*(volatile uint32_t *)(r + VN_REG_DEVICE_ID) != VN_ID_NET) {
++			continue;
++		}
++		regs = r;
++		break;
++	}
++	if (regs == 0) {
++		printf("SWEET NET: no virtio-net device (add -device virtio-net-device)\n");
++		return;
++	}
++	vn.regs = regs;
++
++	/* Reset and negotiate. */
++	vn_wr(VN_REG_STATUS, 0);
++	vn_wr(VN_REG_STATUS, VN_STATUS_ACK);
++	vn_wr(VN_REG_STATUS, VN_STATUS_ACK | VN_STATUS_DRIVER);
++	vn_wr(VN_REG_FEATURES_SEL, 0);
++	features = vn_rd(VN_REG_FEATURES);
++	vn_wr(VN_REG_FEATURES_SEL, 1);
++	features1 = vn_rd(VN_REG_FEATURES);
++	/* VERSION_1 is bit 32 (bit 0 of the second word). */
++	if (!(features1 & 1)) {
++		printf("SWEET NET: device without VERSION_1, not supported\n");
++		return;
++	}
++	vn_wr(VN_REG_FEATURES_SEL, 0);
++	vn_wr(VN_REG_FEATURES, (features & (1u << VN_NET_F_MAC)) ? (1u << VN_NET_F_MAC) : 0);
++	vn_wr(VN_REG_FEATURES_SEL, 1);
++	vn_wr(VN_REG_FEATURES, 1);
++	vn_wr(VN_REG_STATUS, VN_STATUS_ACK | VN_STATUS_DRIVER | VN_STATUS_FEATURES_OK);
++	status = vn_rd(VN_REG_STATUS);
++	if (!(status & VN_STATUS_FEATURES_OK)) {
++		printf("SWEET NET: FEATURES_OK rejected (status 0x%x)\n", status);
++		return;
++	}
++
++	/* Config space: MAC (6 bytes) at 0, status at 6, mtu at 10. */
++	for (i = 0; i < 6; i++) {
++		vn.mac[i] = *(volatile uint8_t *)(vn.regs + 0x100 + i);
++	}
++	vn.mtu = *(volatile uint16_t *)(vn.regs + 0x100 + 10);
++
++	/* One contiguous DMA block for the rings and the buffers. */
++	if (kmem_alloc_contig(kernel_map, &dma, VN_DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET NET: no DMA memory\n");
++		return;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)dma);
++	if (!pn) {
++		return;
++	}
++	vn.dma = (uint8_t *)dma;
++	vn.dma_pa = ptoa_64(pn);
++	vn.rx_desc = (struct vn_desc *)(vn.dma + VN_OFF_RX_DESC);
++	vn.tx_desc = (struct vn_desc *)(vn.dma + VN_OFF_TX_DESC);
++	vn.rx_avail = (struct vn_avail *)(vn.dma + VN_OFF_RX_AVAIL);
++	vn.rx_used = (struct vn_used *)(vn.dma + VN_OFF_RX_USED);
++	vn.tx_avail = (struct vn_avail *)(vn.dma + VN_OFF_TX_AVAIL);
++	vn.tx_used = (struct vn_used *)(vn.dma + VN_OFF_TX_USED);
++	vn.rx_buf = vn.dma + VN_OFF_RX_BUF;
++	vn.tx_buf = vn.dma + VN_OFF_TX_BUF;
++
++	/* Receive buffers. */
++	for (i = 0; i < VN_RX_BUFS; i++) {
++		vn.rx_desc[i].addr = vn.dma_pa + VN_OFF_RX_BUF + (uint64_t)i * VN_BUF_SIZE;
++		vn.rx_desc[i].len = VN_BUF_SIZE;
++		vn.rx_desc[i].flags = VN_DESC_F_WRITE;
++		vn.rx_desc[i].next = 0;
++		vn.rx_avail->ring[i] = i;
++	}
++	vn.rx_next = VN_RX_BUFS;
++	vn.rx_avail->idx = VN_RX_BUFS;
++	vn_clean(vn.dma_pa + VN_OFF_RX_DESC, VN_RX_BUFS * sizeof(struct vn_desc));
++	vn_clean(vn.dma_pa + VN_OFF_RX_AVAIL, sizeof(struct vn_avail));
++
++	/* Transmit queue: empty to start with. */
++	vn_clean(vn.dma_pa + VN_OFF_TX_DESC, VN_QSIZE * sizeof(struct vn_desc));
++	vn_clean(vn.dma_pa + VN_OFF_TX_AVAIL, sizeof(struct vn_avail));
++
++	vn_queue_setup(VN_QUEUE_RX, vn.dma_pa + VN_OFF_RX_DESC,
++	    vn.dma_pa + VN_OFF_RX_AVAIL, vn.dma_pa + VN_OFF_RX_USED);
++	vn_queue_setup(VN_QUEUE_TX, vn.dma_pa + VN_OFF_TX_DESC,
++	    vn.dma_pa + VN_OFF_TX_AVAIL, vn.dma_pa + VN_OFF_TX_USED);
++
++	vn_wr(VN_REG_STATUS, VN_STATUS_ACK | VN_STATUS_DRIVER | VN_STATUS_FEATURES_OK | VN_STATUS_DRIVER_OK);
++	printf("SWEET NET: virtio-net at 0x%llx, dma 0x%llx\n",
++	    (unsigned long long)VN_MMIO_BASE, (unsigned long long)vn.dma_pa);
++
++	vn_if_create();
++
++	if (kernel_thread_start(vn_thread, NULL, &vn.thread) == KERN_SUCCESS) {
++		printf("SWEET NET: poller started\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetNet.cpp b/iokit/Kernel/arm/SweetNet.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNet.cpp
+@@ -0,0 +1,76 @@
++/*
++ * SWEET: the IOKit side of the network interface.
++ *
++ * The iOS userland (configd / SystemConfiguration) only sees interfaces that
++ * are registered in IOKit as IONetworkInterface services: SCNetworkInterface-
++ * CopyAll enumerates them and matches them with the BSD interfaces by
++ * "BSD Name" (see research/network-report.md). The kernel has no
++ * IONetworkingFamily, so this file provides a minimal stand-in with the
++ * properties configd looks at:
++ *
++ *   IOInterfaceType      6 (IFT_ETHER)
++ *   IOInterfaceNamePrefix "en"
++ *   IOInterfaceUnit      0
++ *   BSD Name             "en0"
++ *   IOPrimaryInterface   true
++ *   IOMACAddress         the 6 byte MAC of the virtio-net device
++ *
++ * The device driver (bsd/dev/sweet_virtio_net.c) calls
++ * sweet_netif_publish() once the BSD interface is up.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IORegistryEntry.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSString.h>
++
++class IONetworkInterface : public IOService {
++	OSDeclareDefaultStructors(IONetworkInterface);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++bool
++IONetworkInterface::start(IOService *provider)
++{
++	return IOService::start(provider);
++}
++
++extern "C" void
++sweet_netif_publish(const uint8_t *mac, const char *bsdname, int unit)
++{
++	IONetworkInterface *ifp = OSTypeAlloc(IONetworkInterface);
++	IORegistryEntry *root;
++
++	if (ifp == NULL) {
++		return;
++	}
++	if (!ifp->init()) {
++		ifp->release();
++		return;
++	}
++	root = IORegistryEntry::getRootEntry();
++	if (root == NULL || !ifp->attach(root)) {
++		ifp->release();
++		return;
++	}
++	ifp->setProperty("IOInterfaceType", (unsigned long long)6, 8);
++	ifp->setProperty("IOInterfaceNamePrefix", "en");
++	ifp->setProperty("IOInterfaceUnit", (unsigned long long)unit, 32);
++	ifp->setProperty("BSD Name", bsdname);
++	ifp->setProperty("IOPrimaryInterface", true);
++	OSData *macdata = OSData::withBytes(mac, 6);
++	if (macdata != NULL) {
++		ifp->setProperty("IOMACAddress", macdata);
++		macdata->release();
++	}
++	ifp->registerService();
++	IOLog("SWEET NET: IONetworkInterface %s registered\n", bsdname);
++}
++#endif /* SWEET */
