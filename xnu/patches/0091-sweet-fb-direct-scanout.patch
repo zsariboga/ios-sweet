@@ -1,0 +1,194 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b362110..4368bc6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -84,6 +84,63 @@ enum {
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
++/*
++ * Direct scanout for a host viewer (QEMU, boot-arg sweetfb_scanout=1): instead
++ * of copying the swapped surface into the panel memory, the guest-physical
++ * segments of the single full-screen layer are published here and the host
++ * (iOS16Viewer, sweetmon) reads the pixels straight from guest RAM. Saves the
++ * ~11 MB CPU copy per frame and shows every frame instead of sweetfb_hz.
++ * seq is odd while the record is written (seqlock). valid = 0: read the panel
++ * (several layers, display off, or no usable surface).
++ * Pixel (x, y) of the panel region at (dx, dy) of size w x h is surface byte
++ * offset + (sy + y) * bpr + (sx + x) * 4, looked up in the segment list.
++ */
++#define SWEET_SCANOUT_MAGIC 0x43535753  /* "SWSC" */
++#define SWEET_SCANOUT_SEGS  2048
++struct sweet_scanout_seg {
++	uint64_t pa;
++	uint64_t len;
++};
++struct sweet_scanout_rec {
++	volatile uint32_t magic;
++	volatile uint32_t seq;
++	uint32_t valid;
++	uint32_t surface;
++	uint32_t bpr, sx, sy, w, h, dx, dy;
++	uint32_t nseg;
++	uint64_t offset;
++	struct sweet_scanout_seg seg[SWEET_SCANOUT_SEGS];
++};
++extern "C" {
++/* Unmangled symbol _sweet_scanout: the host finds it in the kernel's symbol table. */
++struct sweet_scanout_rec sweet_scanout;
++}
++
++static void
++sweet_scanout_begin(void)
++{
++	sweet_scanout.magic = SWEET_SCANOUT_MAGIC;
++	sweet_scanout.seq++;
++	__builtin_arm_dmb(0xb);         /* ish */
++}
++
++static void
++sweet_scanout_end(void)
++{
++	__builtin_arm_dmb(0xb);
++	sweet_scanout.seq++;
++}
++
++static void
++sweet_scanout_invalidate(void)
++{
++	if (sweet_scanout.valid) {
++		sweet_scanout_begin();
++		sweet_scanout.valid = 0;
++		sweet_scanout_end();
++	}
++}
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -117,6 +174,7 @@ public:
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	uint32_t      fVsyncUS;       /* vsync period */
++	bool          fScanout;       /* sweetfb_scanout: host reads the surface (sweet_scanout) */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+@@ -124,7 +182,7 @@ public:
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	void present(const uint8_t *rec, bool copy = false);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -201,6 +259,13 @@ AppleCLCD::start(IOService *provider)
+ 	vhz = vhz < 5 ? 5 : (vhz > 60 ? 60 : vhz);
+ 	fVsyncUS = vhz == 60 ? SWEET_FB_VSYNC_US : 1000000 / vhz;
+ 	fFlushTicks = (hz == 0 || hz >= vhz) ? 1 : vhz / hz;
++	uint32_t scanout = 0;
++	PE_parse_boot_argn("sweetfb_scanout", &scanout, sizeof(scanout));
++	fScanout = scanout != 0;
++	if (fScanout) {
++		fFlushTicks = 1;        /* publishing is cheap: every swap reaches the host */
++		IOLog("SWEET FB: direct scanout (sweet_scanout, %u segments max)\n", SWEET_SCANOUT_SEGS);
++	}
+ 	IOLog("SWEET FB: vsync %u Hz, panel copy every %u vsyncs\n", vhz, fFlushTicks);
+ 	fVsync->setTimeoutUS(fVsyncUS);
+ 
+@@ -232,12 +297,25 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
++		sweet_scanout_invalidate();     /* the host shows the (fading) panel */
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= 6) {
+ 			fb->fFadeStep = step + 1;
+ 		}
++		uint8_t *last = NULL;
++		if (fb->fScanout && step == 0) {
++			/* The panel memory is stale in scanout mode: copy the last frame once to fade it. */
++			last = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++			if (last != NULL) {
++				memcpy(last, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			}
++		}
+ 		IOLockUnlock(fb->fLock);
++		if (last != NULL) {
++			fb->present(last, true);
++			IOFreeData(last, SWEET_FB_SWAP_REC_SIZE);
++		}
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+@@ -316,9 +394,12 @@ AppleCLCD::swap(const uint8_t *rec)
+ }
+ 
+ void
+-AppleCLCD::present(const uint8_t *rec)
++AppleCLCD::present(const uint8_t *rec, bool copy)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	/* Scanout needs exactly one enabled layer (the host shows one surface). */
++	bool scan = fScanout && !copy && __builtin_popcount(mask & 0xf) == 1;
++	bool published = false;
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -397,6 +478,44 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++		if (scan && src != 0 && bpe == 4) {
++			/* Publish the guest-physical segments of the surface (see sweet_scanout). */
++			IOByteCount len = s->memory->getLength(), off = 0;
++			uint32_t n = 0;
++			sweet_scanout_begin();
++			while (off < len && n < SWEET_SCANOUT_SEGS) {
++				IOByteCount seglen = 0;
++				addr64_t pa = s->memory->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
++				if (pa == 0 || seglen == 0) {
++					break;
++				}
++				if (n > 0 && sweet_scanout.seg[n - 1].pa + sweet_scanout.seg[n - 1].len == pa) {
++					sweet_scanout.seg[n - 1].len += seglen;
++				} else {
++					sweet_scanout.seg[n].pa = pa;
++					sweet_scanout.seg[n].len = seglen;
++					n++;
++				}
++				off += seglen;
++			}
++			sweet_scanout.valid = off >= len;
++			sweet_scanout.surface = s->id;
++			sweet_scanout.bpr = s->bytesPerRow;
++			sweet_scanout.sx = (uint32_t)sx;
++			sweet_scanout.sy = (uint32_t)sy;
++			sweet_scanout.w = (uint32_t)w;
++			sweet_scanout.h = (uint32_t)h;
++			sweet_scanout.dx = (uint32_t)dx;
++			sweet_scanout.dy = (uint32_t)dy;
++			sweet_scanout.nseg = n;
++			sweet_scanout.offset = s->offset;
++			sweet_scanout_end();
++			published = sweet_scanout.valid != 0;
++			if (published) {
++				s->release();
++				continue;
++			}
++		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+@@ -406,6 +525,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	if (fScanout && !published) {
++		sweet_scanout_invalidate();     /* this frame went to the panel memory */
++	}
+ }
+ 
+ bool
