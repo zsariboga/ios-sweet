@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/memdev.c b/bsd/dev/memdev.c
+index 1567f9e..457ade1 100644
+--- a/bsd/dev/memdev.c
++++ b/bsd/dev/memdev.c
+@@ -178,6 +178,9 @@ int mdevCMajor = -1;
+ 
+ static int      mdevioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p, int is_char);
+ dev_t           mdevadd(int devid, uint64_t base, unsigned int size, int phys);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern void sweet_sample_start(void);   /* bsd/dev/sweet_sample.c */
++#endif
+ dev_t           mdevlookup(int devid);
+ void            mdevremoveall(void);
+ int             mdevgetrange(int devid, uint64_t *base, uint64_t *size);
+@@ -709,6 +712,10 @@ mdevadd(int devid, uint64_t base, unsigned int size, int phys)
+ 	mdev[devid].mdFlags |= mdInited;                                        /* Show we are all set up */
+ 	printf("Added memory device md%x/rmd%x (%08X/%08X) at %016llX for %016llX\n",
+ 	    devid, devid, mdev[devid].mdBDev, mdev[devid].mdCDev, base << 12, (uint64_t)size << 12);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* md0 root (QEMU): no UFS root to start the process sampler from. */
++	sweet_sample_start();
++#endif
+ 	return mdev[devid].mdBDev;
+ }
+ 
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..eca93ed 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -81,7 +81,13 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ void
+ sweet_sample_start(void)
+ {
++	/* Called from the UFS root (phone) and from mdevadd (QEMU md0 root). */
++	static bool started;
+ 	thread_t thread;
++	if (started) {
++		return;
++	}
++	started = true;
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
