@@ -1,0 +1,53 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..9f4a616 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -367,6 +367,7 @@ protected:
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
+ 	IOLock *fLock;
++	int fPanelW, fPanelH;                   /* digitizer/panel pixels */
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+@@ -433,11 +434,25 @@ SweetHIDTouch::start(IOService *provider)
+ 		return false;
+ 	}
+ 	int native = 0;
++	PE_Video video;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	/*
++	 * The digitizer covers the panel. Take the panel size from the boot
++	 * framebuffer instead of assuming 1080x2400, so the normalization stays
++	 * right for other panel sizes (e.g. the 750x1624 @2x build).
++	 */
++	PE_current_console(&video);
++	fPanelW = video.v_width > 0 ? (int)video.v_width : 1080;
++	fPanelH = video.v_height > 0 ? (int)video.v_height : 2400;
++	fLogicalW = fPanelW;
++	fLogicalH = fPanelH;
++	if (!native && fPanelW >= 1000 && fPanelH >= 2000) {
++		/* presented as the iPhone X panel, see SweetFramebuffer.cpp */
++		fLogicalW = 1125;
++		fLogicalH = 2436;
++	}
++	fOffX = (fLogicalW - fPanelW) / 2;
++	fOffY = (fLogicalH - fPanelH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -458,8 +473,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x >= fPanelW ? fPanelW - 1 : x);
++	y = y < 0 ? 0 : (y >= fPanelH ? fPanelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
