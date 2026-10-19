@@ -1,0 +1,162 @@
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index 241bfcf..d0cabd1 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -10,7 +10,9 @@
+  * with tools/sweet-crash.py). A thread blocked in a syscall shows the
+  * syscall stub in pc and its caller in lr/bt.
+  *
+- * "*" samples every process, main thread only.
++ * "*" samples every process, main thread only. "+" (live only, "+N" = N
++ * passes 100 ms apart) is a profiler: every process, only threads that are
++ * running or runnable.
+  *
+  * First sample sweetsample_first s after start (90), then every
+  * sweetsample_iv s (120), sweetsample_n samples (40, 0 = no limit).
+@@ -75,13 +77,13 @@ static int
+ sweet_sample_proc(proc_t p, void *arg)
+ {
+ 	const char *names = arg;
+-	bool all = names[0] == '*';
++	bool all = names[0] == '*', prof = names[0] == '+';
+ 	char name[32];
+ 	proc_name(proc_pid(p), name, sizeof(name));
+-	if (all || sweet_sample_wanted(names, name)) {
++	if (all || prof || sweet_sample_wanted(names, name)) {
+ 		task_t task = proc_task(p);
+ 		if (task != TASK_NULL) {
+-			sweet_sample_task(name, proc_pid(p), task, all ? 1 : 0);
++			sweet_sample_task(name, proc_pid(p), task, prof ? -1 : (all ? 1 : 0));
+ 		}
+ 	}
+ 	return PROC_RETURNED;
+@@ -113,8 +115,21 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 		if (sweet_sample_now[0] != '\0') {
+ 			strlcpy(now, sweet_sample_now, sizeof(now));
+ 			memset(sweet_sample_now, 0, sizeof(sweet_sample_now));
+-			printf("SMP --- live %s\n", now);
+-			proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, now, NULL, NULL);
++			/* "+N": profiler, N passes 100 ms apart over every running thread */
++			int passes = 1;
++			if (now[0] == '+' && now[1] >= '1' && now[1] <= '9') {
++				passes = 0;
++				for (const char *c = now + 1; *c >= '0' && *c <= '9' && passes < 1000; c++) {
++					passes = passes * 10 + (*c - '0');
++				}
++			}
++			for (int pass = 0; pass < passes; pass++) {
++				printf("SMP --- live %s%s\n", now, passes > 1 ? " pass" : "");
++				proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, now, NULL, NULL);
++				if (pass + 1 < passes) {
++					(void)tsleep(&chan, PZERO, "sweetsmp", hz / 10 > 0 ? hz / 10 : 1);
++				}
++			}
+ 			printf("SMP --- live end\n");
+ 		}
+ 		if (periodic && t >= next && (count == 0 || i < (int)count)) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..b362110 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -25,7 +25,9 @@
+  * Everything else is accepted and logged once.
+  *
+  * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
++ * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer
++ * (boot-arg sweetfb_vsync_hz: CoreAnimation renders one frame per vsync in
++ * software, so a lower rate saves CPU in proportion under emulation) that
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+@@ -114,6 +116,7 @@ public:
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++	uint32_t      fVsyncUS;       /* vsync period */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+@@ -192,10 +195,14 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	uint32_t hz = 10;
++	uint32_t hz = 10, vhz = 60;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	PE_parse_boot_argn("sweetfb_vsync_hz", &vhz, sizeof(vhz));
++	vhz = vhz < 5 ? 5 : (vhz > 60 ? 60 : vhz);
++	fVsyncUS = vhz == 60 ? SWEET_FB_VSYNC_US : 1000000 / vhz;
++	fFlushTicks = (hz == 0 || hz >= vhz) ? 1 : vhz / hz;
++	IOLog("SWEET FB: vsync %u Hz, panel copy every %u vsyncs\n", vhz, fFlushTicks);
++	fVsync->setTimeoutUS(fVsyncUS);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -239,7 +246,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		sender->setTimeoutUS(fb->fVsyncUS);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -256,7 +263,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sender->setTimeoutUS(fb->fVsyncUS);
+ }
+ 
+ void
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 5fcde23..478d8c3 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1000,7 +1000,8 @@ void sweet_sample_task(const char *name, int pid, task_t task, int maxthreads);
+  * One header line per thread with the kernel side of the wait (thread state,
+  * block_hint = what kind of object it blocks on, wait_event), then the user
+  * backtrace in lines of at most 8 frames: the console drops the tail of
+- * long lines.
++ * long lines. maxthreads > 0: only the first threads; < 0: only threads
++ * that are running or runnable (TH_RUN; profiler mode, header only if any).
+  */
+ void
+ sweet_sample_task(const char *name, int pid, task_t task, int maxthreads)
+@@ -1009,14 +1010,13 @@ sweet_sample_task(const char *name, int pid, task_t task, int maxthreads)
+ 	uint64_t slide = 0;
+ 	int tn = 0;
+ 	thread_t thread;
++	bool header = false;
+ 	vm_shared_region_t sr = vm_shared_region_get(task);
+ 
+ 	if (sr != NULL) {
+ 		slide = sr->sr_slide;
+ 		vm_shared_region_deallocate(sr);
+ 	}
+-	printf("SMP %s[%d] slide 0x%llx mh 0x%llx threads %d\n", name, pid, slide, task->mach_header_vm_address,
+-	    task->thread_count);
+ 
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+@@ -1028,9 +1028,15 @@ sweet_sample_task(const char *name, int pid, task_t task, int maxthreads)
+ 		if (maxthreads > 0 && tn >= maxthreads) {
+ 			break;
+ 		}
+-		if (ss == NULL || !is_saved_state64(ss)) {
++		if (ss == NULL || !is_saved_state64(ss) || (maxthreads < 0 && !(thread->state & TH_RUN))) {
++			tn++;
+ 			continue;
+ 		}
++		if (!header) {
++			printf("SMP %s[%d] slide 0x%llx mh 0x%llx threads %d\n", name, pid, slide,
++			    task->mach_header_vm_address, task->thread_count);
++			header = true;
++		}
+ 		fp = get_saved_state_fp(ss);
+ 		printf("SMP %s t%d tid %llu st 0x%x hint %d wev 0x%llx pc 0x%llx lr 0x%llx sp 0x%llx\n", name, tn,
+ 		    thread_tid(thread), thread->state, (int)thread->block_hint,
