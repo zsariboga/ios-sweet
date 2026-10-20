@@ -1,0 +1,151 @@
+diff --git a/iokit/Kernel/arm/SweetAccel.cpp b/iokit/Kernel/arm/SweetAccel.cpp
+index a20c434..32cdfe7 100644
+--- a/iokit/Kernel/arm/SweetAccel.cpp
++++ b/iokit/Kernel/arm/SweetAccel.cpp
+@@ -63,12 +63,42 @@ struct sweet_gl_table sweet_gl;
+ 
+ static IOLock *sweet_gl_lock;
+ 
++/*
++ * Ring buffers are kept for the life of the system and reused by slot: a
++ * client asks minutes after boot, when 32 MB of contiguous memory is often
++ * gone ("no contiguous 32 MB ring"), so the first SWEET_GL_PREALLOC rings
++ * are allocated in start(), and smaller sizes are tried before giving up.
++ */
++#define SWEET_GL_PREALLOC       2
++#define SWEET_GL_RING_MIN       (4u << 20)
++
++static IOBufferMemoryDescriptor *sweet_gl_pool[SWEET_GL_RINGS];
++static bool sweet_gl_busy[SWEET_GL_RINGS];
++
++static IOBufferMemoryDescriptor *
++sweet_gl_alloc_ring(void)
++{
++	IOBufferMemoryDescriptor *md;
++
++	for (uint32_t size = SWEET_GL_RING_SIZE; size >= SWEET_GL_RING_MIN; size >>= 1) {
++		md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared,
++		    size, 0x0000fffffffff000ULL);
++		if (md != NULL) {
++			return md;
++		}
++		IOLog("SWEET GL: no contiguous %u MB ring\n", size >> 20);
++	}
++	return NULL;
++}
++
+ static void
+ sweet_gl_release_slot(int slot)
+ {
+ 	IOLockLock(sweet_gl_lock);
+ 	sweet_gl.ring[slot].pa = 0;
+ 	sweet_gl.ring[slot].seq++;
++	sweet_gl_busy[slot] = false;
+ 	IOLockUnlock(sweet_gl_lock);
+ }
+ 
+@@ -106,46 +136,62 @@ bool
+ SweetAccelUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+ 	uint32_t *hdr;
++	uint64_t size;
++	int i, slot = -1;
+ 
+ 	fSlot = -1;
+ 	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
+ 		return false;
+ 	}
+-	fRing = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared,
+-	    SWEET_GL_RING_SIZE, 0x0000fffffffff000ULL);
+-	if (fRing == NULL) {
+-		IOLog("SWEET GL: no contiguous %u MB ring\n", SWEET_GL_RING_SIZE >> 20);
++	/* A free slot, preferring one whose ring is already allocated. */
++	IOLockLock(sweet_gl_lock);
++	for (i = 0; i < SWEET_GL_RINGS; i++) {
++		if (!sweet_gl_busy[i] && (slot < 0 || sweet_gl_pool[i] != NULL)) {
++			slot = i;
++			if (sweet_gl_pool[i] != NULL) {
++				break;
++			}
++		}
++	}
++	if (slot >= 0) {
++		sweet_gl_busy[slot] = true;
++	}
++	IOLockUnlock(sweet_gl_lock);
++	if (slot < 0) {
++		IOLog("SWEET GL: all %d rings in use\n", SWEET_GL_RINGS);
++		return false;
++	}
++	if (sweet_gl_pool[slot] == NULL) {
++		sweet_gl_pool[slot] = sweet_gl_alloc_ring();
++	}
++	if (sweet_gl_pool[slot] == NULL) {
++		IOLockLock(sweet_gl_lock);
++		sweet_gl_busy[slot] = false;
++		IOLockUnlock(sweet_gl_lock);
+ 		return false;
+ 	}
++	fRing = sweet_gl_pool[slot];
++	fRing->retain();
++	size = fRing->getLength();
+ 	bzero(fRing->getBytesNoCopy(), page_size);
+ 	hdr = (uint32_t *)fRing->getBytesNoCopy();
+ 	hdr[0] = SWEET_GL_RING_MAGIC;
+ 	hdr[1] = 1;                                     /* version */
+-	*(uint64_t *)(hdr + 2) = SWEET_GL_RING_SIZE;
++	*(uint64_t *)(hdr + 2) = size;
+ 
+ 	IOLockLock(sweet_gl_lock);
+-	for (int i = 0; i < SWEET_GL_RINGS; i++) {
+-		if (sweet_gl.ring[i].pa == 0) {
+-			fSlot = i;
+-			sweet_gl.ring[i].size = SWEET_GL_RING_SIZE;
+-			sweet_gl.ring[i].pid = (uint32_t)proc_selfpid();
+-			sweet_gl.ring[i].seq++;
+-			__builtin_arm_dmb(0xb);
+-			sweet_gl.ring[i].pa = fRing->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+-			if (i >= (int)sweet_gl.nrings) {
+-				sweet_gl.nrings = i + 1;
+-			}
+-			break;
+-		}
++	fSlot = slot;
++	sweet_gl.ring[slot].size = size;
++	sweet_gl.ring[slot].pid = (uint32_t)proc_selfpid();
++	sweet_gl.ring[slot].seq++;
++	__builtin_arm_dmb(0xb);
++	sweet_gl.ring[slot].pa = fRing->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	if (slot >= (int)sweet_gl.nrings) {
++		sweet_gl.nrings = slot + 1;
+ 	}
+ 	IOLockUnlock(sweet_gl_lock);
+-	if (fSlot < 0) {
+-		IOLog("SWEET GL: all %d rings in use\n", SWEET_GL_RINGS);
+-		return false;
+-	}
+-	IOLog("SWEET GL: ring %d pid %u pa 0x%llx\n", fSlot, sweet_gl.ring[fSlot].pid,
+-	    sweet_gl.ring[fSlot].pa);
++	IOLog("SWEET GL: ring %d pid %u pa 0x%llx size %llu MB\n", fSlot, sweet_gl.ring[fSlot].pid,
++	    sweet_gl.ring[fSlot].pa, size >> 20);
+ 	return true;
+ }
+ 
+@@ -322,6 +368,15 @@ SweetAccel::start(IOService *provider)
+ 	}
+ 	sweet_gl.magic = SWEET_GL_TABLE_MAGIC;
+ 	sweet_gl.version = 1;
++	for (int i = 0; i < SWEET_GL_PREALLOC; i++) {
++		if (sweet_gl_pool[i] == NULL) {
++			sweet_gl_pool[i] = sweet_gl_alloc_ring();
++		}
++		if (sweet_gl_pool[i] != NULL) {
++			IOLog("SWEET GL: ring %d preallocated, %llu MB\n", i,
++			    (unsigned long long)sweet_gl_pool[i]->getLength() >> 20);
++		}
++	}
+ 	setProperty("SweetAccel", true);
+ 	registerService();
+ 	IOLog("SWEET ACCEL: IOAcceleratorES stub registered\n");
