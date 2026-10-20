@@ -16,6 +16,7 @@
 #include <time.h>
 #include <mach/mach.h>
 #include <os/lock.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include "protocol.h"
 
 typedef mach_port_t io_object_t;
@@ -670,8 +671,49 @@ e_TexSubImage2D(void *c, uint32_t target, int32_t level, int32_t x, int32_t y, i
 }
 
 /*
+ * A surface with no kernel object (id 0: CoreAnimation wraps CPU image
+ * memory with IOSurfaceWrapClientImage) has no physical segments for the
+ * host to read; upload its pixels through the ring instead (CA creates a
+ * texture per image once, so this is not a per-frame copy).
+ */
+static uint64_t g_wrap_seen;
+
+static int
+tex_wrapped_surface(void *c, IOSurfaceRef s, const int32_t *v)
+{
+	uint32_t plane = (uint32_t)v[7], bpp = pixel_bytes((uint32_t)v[5], (uint32_t)v[6]);
+	size_t bpr = IOSurfaceGetPlaneCount(s) > 0 ? IOSurfaceGetBytesPerRowOfPlane(s, plane) : IOSurfaceGetBytesPerRow(s);
+	const void *base = IOSurfaceGetPlaneCount(s) > 0 ? IOSurfaceGetBaseAddressOfPlane(s, plane) : IOSurfaceGetBaseAddress(s);
+	int32_t saved_row, saved_al, saved_sr, saved_sp;
+
+	if (base == NULL || bpp == 0 || bpr % bpp != 0) {
+		return 0;
+	}
+	if (g_wrap_seen++ < 8) {
+		sglog("wrapped surface %p %dx%d bpr %zu fmt 0x%x type 0x%x", (void *)s, v[3], v[4], bpr, v[5], v[6]);
+	}
+	saved_row = g_unpack.row_length;
+	saved_al = g_unpack.alignment;
+	saved_sr = g_unpack.skip_rows;
+	saved_sp = g_unpack.skip_pixels;
+	g_unpack.row_length = (int32_t)(bpr / bpp);
+	g_unpack.alignment = 1;
+	g_unpack.skip_rows = 0;
+	g_unpack.skip_pixels = 0;
+	tex_image(c, SGL_TEX_IMAGE2D, (uint32_t)v[1], 0, (uint32_t)v[2], 0, 0, v[3], v[4],
+	    (uint32_t)v[5], (uint32_t)v[6], base);
+	g_unpack.row_length = saved_row;
+	g_unpack.alignment = saved_al;
+	g_unpack.skip_rows = saved_sr;
+	g_unpack.skip_pixels = saved_sp;
+	return 1;
+}
+
+/*
  * -[EAGLContext texImageIOSurface:...] arrives as gliSetInteger(ctx, 0x38e, v):
- * v = { surface id, target, internalFormat, width, height, format, type, plane }.
+ * v = { surface id, target, internalFormat, width, height, format, type, plane, 0 }.
+ * With the EAGL dyld cache patch (tools/dsc-patches-gl.txt), v[0] and v[8]
+ * carry the low and high halves of the IOSurfaceRef instead.
  * The kernel describes the surface (physical segments) for the host.
  */
 void
@@ -682,6 +724,14 @@ sweetgl_tex_iosurface(void *c, const int32_t *v)
 	kern_return_t kr;
 	uint8_t *p;
 
+	if (v[8] != 0) {
+		IOSurfaceRef s = (IOSurfaceRef)(uintptr_t)((uint64_t)(uint32_t)v[8] << 32 | (uint32_t)v[0]);
+		in = IOSurfaceGetID(s);
+		if (in == 0) {
+			(void)tex_wrapped_surface(c, s, v);
+			return;
+		}
+	}
 	enter(c);
 	if (!ring_open()) {
 		leave();
@@ -694,7 +744,7 @@ sweetgl_tex_iosurface(void *c, const int32_t *v)
 	p = cmd_begin(SGL_TEX_IOSURFACE, (uint32_t)(sizeof(struct sgl_tex_iosurface) + dlen));
 	if (p != NULL) {
 		struct sgl_tex_iosurface t = { (uint32_t)v[1], (uint32_t)v[2], (uint32_t)v[3], (uint32_t)v[4],
-		    (uint32_t)v[5], (uint32_t)v[6], (uint32_t)v[7], 0, (uint32_t)v[0], (uint32_t)dlen };
+		    (uint32_t)v[5], (uint32_t)v[6], (uint32_t)v[7], 0, (uint32_t)in, (uint32_t)dlen };
 		memcpy(p, &t, sizeof(t));
 		memcpy(p + sizeof(t), g_desc, dlen);
 		cmd_end();
