@@ -41,7 +41,8 @@ static volatile uint8_t *g_ring;
 static uint64_t g_data_size;            /* data area bytes */
 static uint64_t g_wpos;                 /* our copy of the ring's wpos */
 static uint64_t g_cur;                  /* wpos after the command being built */
-static int g_open_tried;
+static uint64_t g_open_after_ns;        /* next ring_open attempt (retries every 3 s) */
+static uint64_t g_cmds, g_stat_ns;
 static uint32_t g_last_beat;
 static uint64_t g_beat_seen_ns;
 static uint64_t g_dropped;
@@ -75,11 +76,15 @@ ring_open(void)
 	mach_vm_size_t size = 0;
 	kern_return_t kr;
 
-	if (g_open_tried) {
-		return g_ring != NULL;
+	if (g_ring != NULL) {
+		return 1;
 	}
-	g_open_tried = 1;
+	if (now_ns() < g_open_after_ns) {
+		return 0;
+	}
+	g_open_after_ns = now_ns() + 3000000000ull;
 	if (sweetgl_accel() == 0) {
+		sglog("ring: no IOAcceleratorES service");
 		return 0;
 	}
 	kr = IOServiceOpen(sweetgl_accel(), mach_task_self(), SGL_RING_TYPE, &g_conn);
@@ -176,6 +181,26 @@ cmd_end(void)
 	__atomic_thread_fence(__ATOMIC_RELEASE);
 	g_wpos = g_cur;
 	RING_U64(SGL_OFF_WPOS) = g_wpos;
+	g_cmds++;
+}
+
+/* Once every 10 s: ring position, host progress and drops. */
+static void
+stats(void)
+{
+	uint64_t t = now_ns();
+
+	if (t - g_stat_ns < 10000000000ull) {
+		return;
+	}
+	g_stat_ns = t;
+	if (g_ring == NULL) {
+		sglog("stats: no ring, %llu dropped", (unsigned long long)g_dropped);
+		return;
+	}
+	sglog("stats: %llu cmds, wpos %llu rpos %llu, beat %u, %llu dropped", (unsigned long long)g_cmds,
+	    (unsigned long long)g_wpos, (unsigned long long)RING_U64(SGL_OFF_RPOS), RING_U32(SGL_OFF_BEAT),
+	    (unsigned long long)g_dropped);
 }
 
 static void
@@ -208,6 +233,7 @@ enter(void *ctx)
 	uint32_t id = sweetgl_context_id(ctx);
 
 	os_unfair_lock_lock(&g_lock);
+	stats();
 	if (id != g_cur_ctx) {
 		g_cur_ctx = id;
 		cmd_u32s(SGL_CONTEXT, 1, &id);
