@@ -1,0 +1,330 @@
+diff --git a/iokit/Kernel/arm/SweetAccel.cpp b/iokit/Kernel/arm/SweetAccel.cpp
+index 00445bc..12aff4d 100644
+--- a/iokit/Kernel/arm/SweetAccel.cpp
++++ b/iokit/Kernel/arm/SweetAccel.cpp
+@@ -6,9 +6,9 @@
+  * CoreAnimation falls back to its software renderer. This file registers an
+  * empty IOAcceleratorES so we can watch what userland does next: which
+  * process opens it, with which user client type, and which properties it
+- * sets. Every request is logged and refused, so callers still take their
+- * software fallback. This is the first step towards a paravirtual GLES
+- * engine (research/gles-backend-re.md, research/metal-gles-driver-discovery.md).
++ * sets. Other requests are logged and refused. Type 'SGLR' clients get a
++ * SweetGL command ring (see below; research/gles-backend-re.md,
++ * research/eagl-minimal.md).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -19,8 +19,58 @@
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <libkern/c++/OSString.h>
+ #include <libkern/c++/OSSymbol.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include "SweetSurface.h"
+ 
+ extern "C" void proc_selfname(char *buf, int size);
++extern "C" int proc_selfpid(void);
++
++/*
++ * SweetGL command rings (patch 0095). A GL client (the SweetGL engine,
++ * GLEngine.bundle/SweetGL) opens this service with type 'SGLR' and maps a
++ * physically contiguous ring with IOConnectMapMemory64(type 0). It writes
++ * GL commands there; the host viewer finds the rings through the
++ * sweet_gl table (kernel symbol _sweet_gl), reads them straight from guest
++ * RAM and executes them on the host GPU. Selector 0 describes an IOSurface
++ * (geometry and physical segments) so the host can read its pixels.
++ */
++#define SWEET_GL_TYPE           0x53474c52u     /* 'SGLR' */
++#define SWEET_GL_TABLE_MAGIC    0x54474c53u     /* 'SGLT' */
++#define SWEET_GL_RING_MAGIC     0x51474c53u     /* 'SGLQ' */
++#define SWEET_GL_RINGS          8
++#define SWEET_GL_RING_SIZE      (32u << 20)
++#define SWEET_GL_DESC_HDR       48
++#define SWEET_GL_DESC_MAX       65536
++
++struct sweet_gl_ring_rec {
++	uint64_t pa;            /* ring physical address, 0 = slot free */
++	uint64_t size;
++	uint32_t pid;
++	uint32_t seq;           /* bumped on every (re)use of the slot */
++};
++
++extern "C" {
++struct sweet_gl_table {
++	uint32_t magic;
++	uint32_t version;
++	uint32_t nrings;
++	uint32_t pad;
++	struct sweet_gl_ring_rec ring[SWEET_GL_RINGS];
++};
++struct sweet_gl_table sweet_gl;
++}
++
++static IOLock *sweet_gl_lock;
++
++static void
++sweet_gl_release_slot(int slot)
++{
++	IOLockLock(sweet_gl_lock);
++	sweet_gl.ring[slot].pa = 0;
++	sweet_gl.ring[slot].seq++;
++	IOLockUnlock(sweet_gl_lock);
++}
+ 
+ #define SWEET_ACCEL_LOG_MAX 400
+ #define SWEET_ACCEL_GL_LOG_MAX 20000
+@@ -31,6 +81,209 @@ class IOAcceleratorES : public IOService {
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
++class SweetAccelUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetAccelUserClient);
++
++	IOBufferMemoryDescriptor *fRing;
++	int fSlot;
++
++	IOReturn describeSurface(IOExternalMethodArguments *args);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free() APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
++	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetAccelUserClient, IOUserClient);
++
++bool
++SweetAccelUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	uint32_t *hdr;
++
++	fSlot = -1;
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fRing = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared,
++	    SWEET_GL_RING_SIZE, 0x0000fffffffff000ULL);
++	if (fRing == NULL) {
++		IOLog("SWEET GL: no contiguous %u MB ring\n", SWEET_GL_RING_SIZE >> 20);
++		return false;
++	}
++	bzero(fRing->getBytesNoCopy(), page_size);
++	hdr = (uint32_t *)fRing->getBytesNoCopy();
++	hdr[0] = SWEET_GL_RING_MAGIC;
++	hdr[1] = 1;                                     /* version */
++	*(uint64_t *)(hdr + 2) = SWEET_GL_RING_SIZE;
++
++	IOLockLock(sweet_gl_lock);
++	for (int i = 0; i < SWEET_GL_RINGS; i++) {
++		if (sweet_gl.ring[i].pa == 0) {
++			fSlot = i;
++			sweet_gl.ring[i].size = SWEET_GL_RING_SIZE;
++			sweet_gl.ring[i].pid = (uint32_t)proc_selfpid();
++			sweet_gl.ring[i].seq++;
++			__builtin_arm_dmb(0xb);
++			sweet_gl.ring[i].pa = fRing->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++			if (i >= (int)sweet_gl.nrings) {
++				sweet_gl.nrings = i + 1;
++			}
++			break;
++		}
++	}
++	IOLockUnlock(sweet_gl_lock);
++	if (fSlot < 0) {
++		IOLog("SWEET GL: all %d rings in use\n", SWEET_GL_RINGS);
++		return false;
++	}
++	IOLog("SWEET GL: ring %d pid %u pa 0x%llx\n", fSlot, sweet_gl.ring[fSlot].pid,
++	    sweet_gl.ring[fSlot].pa);
++	return true;
++}
++
++IOReturn
++SweetAccelUserClient::clientClose(void)
++{
++	if (fSlot >= 0) {
++		sweet_gl_release_slot(fSlot);
++		IOLog("SWEET GL: ring %d closed\n", fSlot);
++		fSlot = -1;
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++SweetAccelUserClient::free()
++{
++	if (fSlot >= 0) {
++		sweet_gl_release_slot(fSlot);
++		fSlot = -1;
++	}
++	OSSafeReleaseNULL(fRing);
++	IOUserClient::free();
++}
++
++IOReturn
++SweetAccelUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
++    IOMemoryDescriptor **memory)
++{
++	if (type != 0 || fRing == NULL) {
++		return kIOReturnBadArgument;
++	}
++	fRing->retain();
++	*memory = fRing;
++	*options = 0;
++	return kIOReturnSuccess;
++}
++
++/*
++ * Selector 0: scalar in [surface id] -> struct out: 12 u32 (id, width, height,
++ * bytesPerRow, offset, pixelFormat, allocSize, nseg, planeCount,
++ * bytesPerElement, 0, 0) then nseg (pa, len) u64 pairs covering the
++ * surface memory from offset 0 (contiguous pages merged).
++ */
++IOReturn
++SweetAccelUserClient::describeSurface(IOExternalMethodArguments *args)
++{
++	SweetSurface *s;
++	uint8_t *buf;
++	uint32_t *h;
++	uint64_t *seg;
++	uint32_t n = 0, maxseg, len;
++	IOByteCount off = 0, size;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (args->scalarInputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	s = sweet_surface_copy((uint32_t)args->scalarInput[0]);
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	buf = (uint8_t *)IOMallocZeroData(SWEET_GL_DESC_MAX);
++	if (buf == NULL) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	h = (uint32_t *)buf;
++	seg = (uint64_t *)(buf + SWEET_GL_DESC_HDR);
++	maxseg = (SWEET_GL_DESC_MAX - SWEET_GL_DESC_HDR) / 16;
++	size = s->memory->getLength();
++	while (off < size) {
++		IOByteCount slen = 0;
++		addr64_t pa = s->memory->getPhysicalSegment(off, &slen, kIOMemoryMapperNone);
++		if (pa == 0 || slen == 0) {
++			ret = kIOReturnVMError;
++			break;
++		}
++		if (slen > size - off) {
++			slen = size - off;
++		}
++		if (n > 0 && seg[2 * (n - 1)] + seg[2 * (n - 1) + 1] == pa) {
++			seg[2 * (n - 1) + 1] += slen;
++		} else if (n < maxseg) {
++			seg[2 * n] = pa;
++			seg[2 * n + 1] = slen;
++			n++;
++		} else {
++			ret = kIOReturnNoSpace;
++			break;
++		}
++		off += slen;
++	}
++	h[0] = s->id;
++	h[1] = s->width;
++	h[2] = s->height;
++	h[3] = s->bytesPerRow;
++	h[4] = s->offset;
++	h[5] = s->pixelFormat;
++	h[6] = s->allocSize;
++	h[7] = n;
++	h[8] = s->planeCount;
++	h[9] = s->bytesPerElement;
++	s->release();
++	len = SWEET_GL_DESC_HDR + n * 16;
++	if (ret == kIOReturnSuccess) {
++		if (args->structureOutputDescriptor != NULL) {
++			if (len > args->structureOutputDescriptor->getLength()) {
++				ret = kIOReturnNoSpace;
++			} else {
++				args->structureOutputDescriptor->writeBytes(0, buf, len);
++				args->structureOutputDescriptorSize = len;
++			}
++		} else if (args->structureOutput != NULL && len <= args->structureOutputSize) {
++			memcpy(args->structureOutput, buf, len);
++			args->structureOutputSize = len;
++		} else {
++			ret = kIOReturnNoSpace;
++		}
++	}
++	IOFreeData(buf, SWEET_GL_DESC_MAX);
++	return ret;
++}
++
++IOReturn
++SweetAccelUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	switch (selector) {
++	case 0:
++		return describeSurface(args);
++	default:
++		return kIOReturnUnsupported;
++	}
++}
++
+ class SweetAccel : public IOAcceleratorES {
+ 	OSDeclareDefaultStructors(SweetAccel);
+ 	unsigned fLogged;
+@@ -61,6 +314,11 @@ SweetAccel::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	if (sweet_gl_lock == NULL) {
++		sweet_gl_lock = IOLockAlloc();
++	}
++	sweet_gl.magic = SWEET_GL_TABLE_MAGIC;
++	sweet_gl.version = 1;
+ 	setProperty("SweetAccel", true);
+ 	registerService();
+ 	IOLog("SWEET ACCEL: IOAcceleratorES stub registered\n");
+@@ -73,14 +331,28 @@ SweetAccel::newUserClient(task_t owningTask, void *securityID,
+ {
+ 	char name[32];
+ 
++	if (type == SWEET_GL_TYPE && sweet_gl_lock != NULL) {
++		SweetAccelUserClient *uc = OSTypeAlloc(SweetAccelUserClient);
++		if (uc == NULL) {
++			return kIOReturnNoMemory;
++		}
++		if (!uc->initWithTask(owningTask, securityID, type) || !uc->attach(this)) {
++			uc->release();
++			return kIOReturnNoResources;
++		}
++		if (!uc->start(this)) {
++			uc->detach(this);
++			uc->release();
++			return kIOReturnNoResources;
++		}
++		*handler = uc;
++		return kIOReturnSuccess;
++	}
+ 	if (logOK()) {
+ 		proc_selfname(name, sizeof(name));
+ 		IOLog("SWEET ACCEL: newUserClient type %u from %s (refused)\n",
+ 		    (unsigned)type, name);
+ 	}
+-	(void)owningTask;
+-	(void)securityID;
+-	(void)handler;
+ 	return kIOReturnUnsupported;
+ }
+ 
