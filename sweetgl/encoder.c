@@ -108,7 +108,11 @@ ring_open(void)
 	return 1;
 }
 
-/* Is the host consuming? A beat that has not moved for 2 s means no. */
+/*
+ * Is the host consuming? A beat that has not moved for 2 s means no. Before
+ * the host's first beat (it polls for new rings) commands are kept for up to
+ * 10 s after the ring opened: CoreAnimation compiles its shaders right away.
+ */
 static int
 host_alive(void)
 {
@@ -120,7 +124,10 @@ host_alive(void)
 		g_beat_seen_ns = t;
 		return 1;
 	}
-	return beat != 0 && t - g_beat_seen_ns < 2000000000ull;
+	if (beat == 0) {
+		return t - g_beat_seen_ns < 10000000000ull;
+	}
+	return t - g_beat_seen_ns < 2000000000ull;
 }
 
 static int
