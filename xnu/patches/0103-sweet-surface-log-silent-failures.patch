@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index c494c82..d4fdfa4 100644
+index c494c82..680a243 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -771,7 +771,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
@@ -57,7 +57,7 @@ index c494c82..d4fdfa4 100644
  			IOLog("SWEET SURF: wrap 0x%llx %ux%u failed 0x%x\n", addr, w, h, ret);
  		}
  		s->release();
-@@ -881,6 +889,22 @@ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
+@@ -881,6 +889,21 @@ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
  	return ret;
  }
  
@@ -73,14 +73,13 @@ index c494c82..d4fdfa4 100644
 +	char name[32];
 +	proc_selfname(name, sizeof(name));
 +	sweet_surface_fails_logged++;
-+	IOLog("SWEET SURF: %s sel %u arg 0x%llx -> 0x%x
-+", name, selector, arg0, ret);
++	IOLog("SWEET SURF: %s sel %u arg 0x%llx -> 0x%x\n", name, selector, arg0, ret);
 +}
 +
  IOReturn
  IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
      __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
-@@ -909,6 +933,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -909,6 +932,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  			s->release();
  		}
  		sweet_surf_log_once("sel", selector);
@@ -88,7 +87,7 @@ index c494c82..d4fdfa4 100644
  		return ret;
  	}
  	case kSweetSurfaceLookupFromPort: {
-@@ -920,12 +945,14 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -920,12 +944,14 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  		}
  		OSSafeReleaseNULL(obj);
  		sweet_surf_log_once("sel", selector);
