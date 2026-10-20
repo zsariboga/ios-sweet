@@ -1,0 +1,209 @@
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index d0cabd1..198fdf7 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -26,6 +26,9 @@
+  * write with the VM stopped); a kernel thread polls every 10 ms and feeds
+  * them to the SweetHID services. {1, key, down}: key 0 power, 1 vol+,
+  * 2 vol-, 3 home. {2, finger, down, x, y}: touch in 1080x2400 panel pixels.
++ * {3, usage, down, page}: hardware keyboard key, HID usage (page 0 = the
++ * keyboard page); not logged. {4, attach, country, type}: attach (1, with
++ * HID country code and 0 ANSI / 1 ISO / 2 JIS) or detach (0) the keyboard.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -52,6 +55,8 @@ struct sweet_input sweet_input;  /* written by the host, see above */
+ 
+ extern void sweet_hid_key(int key, int down);                   /* SweetHID.cpp */
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_keyboard(int page, int usage, int down);
++extern void sweet_hid_keyboard_attach(int country, int type);
+ 
+ static bool
+ sweet_sample_wanted(const char *names, const char *name)
+@@ -155,6 +160,10 @@ sweet_input_thread(__unused void *arg, __unused wait_result_t wr)
+ 				sweet_hid_key(e[1], e[2]);
+ 			} else if (e[0] == 2) {
+ 				sweet_hid_touch(e[1], e[2], e[3], e[4]);
++			} else if (e[0] == 3) {
++				sweet_hid_keyboard(e[3], e[1], e[2]);
++			} else if (e[0] == 4) {
++				sweet_hid_keyboard_attach(e[1] ? e[2] : -1, e[3]);
+ 			}
+ 			sweet_input.done++;
+ 		}
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 9f4a616..2a6d491 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -11,10 +11,13 @@
+  *
+  *   SweetHIDButtons  consumer-control keys (power, volume, home)
+  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
++ *   SweetHIDKeyboard a USB hardware keyboard (keyboard page keys), published
++ *                    only while the host has one attached
+  *
+- * Hardware drivers feed them through the C entry points sweet_hid_key()
+- * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
+- * every N seconds, to test the event path without input hardware.
++ * Hardware drivers feed them through the C entry points sweet_hid_key(),
++ * sweet_hid_touch(), sweet_hid_keyboard() and sweet_hid_keyboard_attach().
++ * Boot-arg sweethidtest=N (seconds) presses Home every N seconds, to test
++ * the event path without input hardware.
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+@@ -376,8 +379,43 @@ private:
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
++/*
++ * Hardware keyboard. backboardd takes any service whose primary usage is
++ * GenericDesktop/Keyboard as an attached hardware keyboard
++ * (BKKeyboardHIDEventProcessor -> GSKeyboardSetHardwareKeyboardAttached)
++ * and UIKit then hides the software keyboard, so the service exists only
++ * while the host has a keyboard attached: sweet_hid_keyboard_attach()
++ * creates and registers it, detach terminates it. CountryCode and
++ * StandardType are what a USB keyboard reports; GraphicsServices picks the
++ * default layout from the country code (USBKeyboardLayouts.plist: 31
++ * Turkish-Q -> Turkish-QWERTY-PC). Keys are HID usages (key positions);
++ * key repeat, modifiers and caps lock are done by the userland keyboard
++ * filter (IOHIDKeyboardFilter). Typed keys are not logged.
++ */
++#define SWEET_KBD_USAGES 256
++class SweetHIDKeyboard : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDKeyboard);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void key(UInt32 page, UInt32 usage, bool down);
++	void releaseKeys();
++	UInt32 fCountry, fStandard;
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_GenericDesktop; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_GD_Keyboard; }
++	virtual OSString *getTransport() APPLE_KEXT_OVERRIDE { return OSString::withCString("USB"); }
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("Sweet Keyboard"); }
++	/* not Apple's vendor ID: no Apple keyboard quirks in the keyboard filter */
++	virtual UInt32 getVendorID() APPLE_KEXT_OVERRIDE { return 0x1209; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 3; }
++private:
++	uint8_t fDown[SWEET_KBD_USAGES / 8];    /* keyboard page keys held */
++};
++OSDefineMetaClassAndStructors(SweetHIDKeyboard, IOHIDEventService);
++
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
++static SweetHIDKeyboard *gSweetKeyboard;
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -553,6 +591,50 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	collection->release();
+ }
+ 
++bool
++SweetHIDKeyboard::start(IOService *provider)
++{
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOHIDBuiltInKey, kOSBooleanFalse);
++	setProperty(kIOHIDCountryCodeKey, fCountry, 32);
++	setProperty(kIOHIDStandardTypeKey, fStandard, 32);
++	/* the host may send Apple's Globe key (top case page, Fn usage) */
++	setProperty("SupportsGlobeKey", kOSBooleanTrue);
++	registerService();
++	IOLog("SWEET HID: keyboard attached (country %u, type %u)\n", (unsigned)fCountry, (unsigned)fStandard);
++	return true;
++}
++
++void
++SweetHIDKeyboard::key(UInt32 page, UInt32 usage, bool down)
++{
++	if (page == kHIDPage_KeyboardOrKeypad && usage < SWEET_KBD_USAGES) {
++		uint8_t bit = (uint8_t)(1 << (usage & 7));
++		if (((fDown[usage >> 3] & bit) != 0) == down) {
++			return;         /* host repeats: the keyboard filter makes its own */
++		}
++		fDown[usage >> 3] ^= bit;
++	}
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), page, usage, down);
++
++	if (event) {
++		dispatchEvent(event);
++		event->release();
++	}
++}
++
++void
++SweetHIDKeyboard::releaseKeys()
++{
++	for (UInt32 usage = 0; usage < SWEET_KBD_USAGES; usage++) {
++		if (fDown[usage >> 3] & (1 << (usage & 7))) {
++			key(kHIDPage_KeyboardOrKeypad, usage, false);
++		}
++	}
++}
++
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
+ extern "C" void
+ sweet_hid_key(int key, int down)
+@@ -574,3 +656,58 @@ sweet_hid_touch(int finger, int down, int x, int y)
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++/*
++ * country: HID country code (0 none, 31 Turkish-Q, 33 US, 35 Turkish-F),
++ * type: 0 ANSI, 1 ISO, 2 JIS. country < 0 detaches the keyboard.
++ * Called from one thread (sweet_sample.c input ring).
++ */
++extern "C" void
++sweet_hid_keyboard_attach(int country, int type)
++{
++	SweetHIDKeyboard *k = gSweetKeyboard;
++	IOService *provider = IOService::getResourceService();
++
++	if (country < 0) {
++		if (k) {
++			gSweetKeyboard = NULL;
++			k->releaseKeys();
++			k->terminate();
++			k->release();
++			IOLog("SWEET HID: keyboard detached\n");
++		}
++		return;
++	}
++	if (k || !provider) {
++		return;
++	}
++	k = OSTypeAlloc(SweetHIDKeyboard);
++	if (!k || !k->init()) {
++		OSSafeReleaseNULL(k);
++		return;
++	}
++	k->fCountry = (UInt32)country;
++	k->fStandard = type > 0 && type <= 2 ? (UInt32)type : 0;
++	if (!k->attach(provider)) {
++		k->release();
++		return;
++	}
++	if (!k->start(provider)) {
++		k->detach(provider);
++		k->release();
++		return;
++	}
++	gSweetKeyboard = k;
++}
++
++/* page 0 = keyboard page; a key down with no keyboard attached attaches one (no country code) */
++extern "C" void
++sweet_hid_keyboard(int page, int usage, int down)
++{
++	if (!gSweetKeyboard && down) {
++		sweet_hid_keyboard_attach(0, 0);
++	}
++	if (gSweetKeyboard && usage >= 0) {
++		gSweetKeyboard->key(page > 0 ? (UInt32)page : kHIDPage_KeyboardOrKeypad, (UInt32)usage, down != 0);
++	}
++}
