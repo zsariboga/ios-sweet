@@ -1,0 +1,200 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 135fe58..3b7870d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -179,6 +179,12 @@ public:
+ 	bool          fScanout;       /* sweetfb_scanout: host reads the surface (sweet_scanout) */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	IOLock       *fPresentLock;   /* present(): swap path and vsync path */
++	/* frame pacing stats (one log line a second while swapping, boot-arg sweetfb_pacelog=0: off) */
++	bool          fPaceLog;
++	uint64_t      fPaceStart, fPaceLastVsync;
++	uint32_t      fPaceSwaps, fPaceSame, fPaceMiss, fPaceLines;
++	uint32_t      fPacePhase[5];  /* swap time after the vsync: <4, <8, <12, <16.7 ms, later */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -240,11 +246,12 @@ AppleCLCD::start(IOService *provider)
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
++	fPresentLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+-	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
++	if (fLock == NULL || fPresentLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+ 		OSSafeReleaseNULL(fWorkLoop);
+@@ -266,8 +273,11 @@ AppleCLCD::start(IOService *provider)
+ 	fScanout = scanout != 0;
+ 	if (fScanout) {
+ 		fFlushTicks = 1;        /* publishing is cheap: every swap reaches the host */
+-		IOLog("SWEET FB: direct scanout (sweet_scanout, %u segments max)\n", SWEET_SCANOUT_SEGS);
++		IOLog("SWEET FB: direct scanout (sweet_scanout, %u segments max), published at swap time\n", SWEET_SCANOUT_SEGS);
+ 	}
++	uint32_t pacelog = 1;
++	PE_parse_boot_argn("sweetfb_pacelog", &pacelog, sizeof(pacelog));
++	fPaceLog = pacelog != 0;
+ 	IOLog("SWEET FB: vsync %u Hz, panel copy every %u vsyncs\n", vhz, fFlushTicks);
+ 	nanoseconds_to_absolutetime((uint64_t)fVsyncUS * 1000, &fVsyncAbs);
+ 	fVsyncNext = mach_absolute_time() + fVsyncAbs;
+@@ -391,6 +401,19 @@ get32(const uint8_t *p, uint32_t off)
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
++/* segment lists of recently scanned-out surfaces (present(), under fPresentLock) */
++#define SWEET_SEG_CACHE 3
++struct sweet_seg_cache {
++	uint32_t id;
++	bool complete;
++	const void *mem;
++	IOByteCount len;
++	uint32_t n;
++	struct sweet_scanout_seg seg[SWEET_SCANOUT_SEGS];
++};
++static struct sweet_seg_cache sweet_segs[SWEET_SEG_CACHE];
++static uint32_t sweet_seg_cache_next;
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+@@ -401,13 +424,52 @@ static uint64_t sweet_fb_swap_count;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	uint64_t now = mach_absolute_time();
++	/*
++	 * Scanout: publish now instead of at the next vsync tick. The host shows
++	 * frames on its own display clock; latching here only lost frames (a late
++	 * swap followed by an early one inside one tick overwrote the first) and
++	 * added up to a period of latency. The fade while off stays on the timer.
++	 */
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-	fDirty = true;
++	bool direct = fScanout && !fPowerOff;
++	fDirty = !direct;
++	uint64_t vcount = fVsyncCount, ideal = fVsyncNext - fVsyncAbs;
+ 	IOLockUnlock(fLock);
++	if (direct) {
++		present(rec);
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
++	if (!fPaceLog) {
++		return;
++	}
++	/* pacing: when in the period the swap came, and how many vsyncs since the last swap */
++	uint64_t ns;
++	absolutetime_to_nanoseconds(now > ideal ? now - ideal : 0, &ns);
++	uint32_t ms = (uint32_t)(ns / 1000000);
++	fPacePhase[ms < 4 ? 0 : ms < 8 ? 1 : ms < 12 ? 2 : ms < 17 ? 3 : 4]++;
++	uint64_t gap = vcount - fPaceLastVsync;
++	if (fPaceSwaps > 0 && gap == 0) {
++		fPaceSame++;            /* two swaps in one period */
++	} else if (fPaceSwaps > 0 && gap >= 2 && gap <= 6) {
++		fPaceMiss += (uint32_t)(gap - 1);  /* vsyncs without a frame inside an animation */
++	}
++	fPaceLastVsync = vcount;
++	fPaceSwaps++;
++	absolutetime_to_nanoseconds(now - fPaceStart, &ns);
++	if (fPaceStart == 0 || ns >= 1000000000ULL) {
++		if (fPaceStart != 0 && fPaceSwaps > 1 && fPaceLines < 5000) {
++			fPaceLines++;
++			IOLog("SWEET FB: pace %u swaps, same-period %u, missed vsyncs %u, swap after vsync <4ms %u <8 %u <12 %u <17 %u later %u\n",
++			    fPaceSwaps, fPaceSame, fPaceMiss, fPacePhase[0], fPacePhase[1], fPacePhase[2], fPacePhase[3], fPacePhase[4]);
++		}
++		fPaceStart = now;
++		fPaceSwaps = fPaceSame = fPaceMiss = 0;
++		bzero(fPacePhase, sizeof(fPacePhase));
++	}
+ }
+ 
+ void
+@@ -426,6 +488,7 @@ AppleCLCD::present(const uint8_t *rec, bool copy)
+ 	bool published = false;
+ 	static uint32_t multi_logged;
+ 
++	IOLockLock(fPresentLock);
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -514,26 +577,49 @@ AppleCLCD::present(const uint8_t *rec, bool copy)
+ 			src = 0;
+ 		}
+ 		if (scan && src != 0 && bpe == 4) {
+-			/* Publish the guest-physical segments of the surface (see sweet_scanout). */
+-			IOByteCount len = s->memory->getLength(), off = 0;
+-			uint32_t n = 0;
+-			sweet_scanout_begin();
+-			while (off < len && n < SWEET_SCANOUT_SEGS) {
+-				IOByteCount seglen = 0;
+-				addr64_t pa = s->memory->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
+-				if (pa == 0 || seglen == 0) {
++			/*
++			 * Publish the guest-physical segments of the surface (see sweet_scanout).
++			 * CA cycles through 2-3 screen surfaces: their segment lists (~690
++			 * getPhysicalSegment calls each) are cached by surface id + memory.
++			 */
++			IOByteCount len = s->memory->getLength();
++			struct sweet_seg_cache *ce = NULL;
++			for (uint32_t k = 0; k < SWEET_SEG_CACHE; k++) {
++				if (sweet_segs[k].id == s->id && sweet_segs[k].mem == s->memory &&
++				    sweet_segs[k].len == len) {
++					ce = &sweet_segs[k];
+ 					break;
+ 				}
+-				if (n > 0 && sweet_scanout.seg[n - 1].pa + sweet_scanout.seg[n - 1].len == pa) {
+-					sweet_scanout.seg[n - 1].len += seglen;
+-				} else {
+-					sweet_scanout.seg[n].pa = pa;
+-					sweet_scanout.seg[n].len = seglen;
+-					n++;
++			}
++			if (ce == NULL) {
++				ce = &sweet_segs[sweet_seg_cache_next++ % SWEET_SEG_CACHE];
++				IOByteCount off = 0;
++				uint32_t n = 0;
++				while (off < len && n < SWEET_SCANOUT_SEGS) {
++					IOByteCount seglen = 0;
++					addr64_t pa = s->memory->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
++					if (pa == 0 || seglen == 0) {
++						break;
++					}
++					if (n > 0 && ce->seg[n - 1].pa + ce->seg[n - 1].len == pa) {
++						ce->seg[n - 1].len += seglen;
++					} else {
++						ce->seg[n].pa = pa;
++						ce->seg[n].len = seglen;
++						n++;
++					}
++					off += seglen;
+ 				}
+-				off += seglen;
++				ce->id = s->id;
++				ce->mem = s->memory;
++				ce->len = len;
++				ce->n = n;
++				ce->complete = off >= len;
+ 			}
+-			sweet_scanout.valid = off >= len;
++			uint32_t n = ce->n;
++			sweet_scanout_begin();
++			memcpy(sweet_scanout.seg, ce->seg, (size_t)n * sizeof(ce->seg[0]));
++			sweet_scanout.valid = ce->complete;
+ 			sweet_scanout.surface = s->id;
+ 			sweet_scanout.bpr = s->bytesPerRow;
+ 			sweet_scanout.sx = (uint32_t)sx;
+@@ -563,6 +649,7 @@ AppleCLCD::present(const uint8_t *rec, bool copy)
+ 	if (fScanout && !published) {
+ 		sweet_scanout_invalidate();     /* this frame went to the panel memory */
+ 	}
++	IOLockUnlock(fPresentLock);
+ }
+ 
+ bool
