@@ -1,0 +1,105 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index c494c82..d4fdfa4 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -771,7 +771,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			}
+ 		}
+ 	}
+-	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
++	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 1000) {
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+ 		sweet_surface_creates_logged++;
+@@ -798,7 +798,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+  * can read them from guest RAM. Answering this selector with an empty lock
+  * result (as before) gave CoreAnimation id-0 surfaces with no pixels.
+  */
+-static uint32_t sweet_surface_wraps_logged;
++static uint32_t sweet_surface_wraps_logged, sweet_surface_wrap_fails_logged;
+ 
+ IOReturn
+ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
+@@ -836,6 +836,14 @@ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
+ 	}
+ 	if (addr == 0 || w == 0 || h == 0 || bpe == 0 || w > SWEET_SURFACE_MAX_DIM || h > SWEET_SURFACE_MAX_DIM ||
+ 	    len > SWEET_SURFACE_MAX_ALLOC) {
++		/* patch 0103: these rejections were silent (template symbols drew as boxes) */
++		if (sweet_surface_wrap_fails_logged < 300) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			sweet_surface_wrap_fails_logged++;
++			IOLog("SWEET SURF: %s wrap REJECT 0x%llx %ux%u fmt 0x%x bpe %u a3 %u a4 %u len %llu\n",
++			    name, addr, w, h, fmt, bpe, a3, a4, len);
++		}
+ 		return kIOReturnBadArgument;
+ 	}
+ 	SweetSurface *s = sweet_surface_alloc();
+@@ -859,8 +867,8 @@ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
+ 	s->memory = IOMemoryDescriptor::withAddressRange(addr, len, kIODirectionOut, fTask);
+ 	ret = kIOReturnVMError;
+ 	IOReturn pr = s->memory != NULL ? s->memory->prepare() : kIOReturnNoMemory;
+-	if (pr != kIOReturnSuccess && sweet_surface_wraps_logged < 96) {
+-		sweet_surface_wraps_logged++;
++	if (pr != kIOReturnSuccess && sweet_surface_wrap_fails_logged < 300) {
++		sweet_surface_wrap_fails_logged++;
+ 		IOLog("SWEET SURF: wrap 0x%llx len %llu prepare 0x%x\n", addr, len, pr);
+ 	}
+ 	if (pr == kIOReturnSuccess) {     /* completed by free() */
+@@ -869,8 +877,8 @@ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
+ 		ret = sweet_surface_publish(s) ? kIOReturnSuccess : kIOReturnNoResources;
+ 	}
+ 	if (ret != kIOReturnSuccess) {
+-		if (sweet_surface_wraps_logged < 96) {
+-			sweet_surface_wraps_logged++;
++		if (sweet_surface_wrap_fails_logged < 300) {
++			sweet_surface_wrap_fails_logged++;
+ 			IOLog("SWEET SURF: wrap 0x%llx %ux%u failed 0x%x\n", addr, w, h, ret);
+ 		}
+ 		s->release();
+@@ -881,6 +889,22 @@ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
+ 	return ret;
+ }
+ 
++/* patch 0103: failed lookups were silent */
++static uint32_t sweet_surface_fails_logged;
++
++static void
++sweet_surf_log_fail(uint32_t selector, uint64_t arg0, IOReturn ret)
++{
++	if (ret == kIOReturnSuccess || sweet_surface_fails_logged >= 300) {
++		return;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	sweet_surface_fails_logged++;
++	IOLog("SWEET SURF: %s sel %u arg 0x%llx -> 0x%x
++", name, selector, arg0, ret);
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -909,6 +933,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 			s->release();
+ 		}
+ 		sweet_surf_log_once("sel", selector);
++		sweet_surf_log_fail(selector, arg0, ret);
+ 		return ret;
+ 	}
+ 	case kSweetSurfaceLookupFromPort: {
+@@ -920,12 +945,14 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		}
+ 		OSSafeReleaseNULL(obj);
+ 		sweet_surf_log_once("sel", selector);
++		sweet_surf_log_fail(selector, arg0, ret);
+ 		return ret;
+ 	}
+ 	case kSweetSurfaceCreatePort: {
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+ 		if (s == NULL || args->scalarOutputCount < 1) {
+ 			OSSafeReleaseNULL(s);
++			sweet_surf_log_fail(selector, arg0, kIOReturnNotFound);
+ 			return kIOReturnNotFound;
+ 		}
+ 		args->scalarOutput[0] = sweet_surface_port_in_task(s, fTask);
