@@ -1,0 +1,21 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 680a243..0fc4bbd 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -731,6 +731,16 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		if (ulen < need) {
+ 			ulen = need;
+ 		}
++		/*
++		 * CoreAnimation's GL renderer passes pixel format 0 for these
++		 * (the Metal renderer never asks); EAGL rejects format 0
++		 * ("Unsupported IOSurface format"), leaving SF Symbols, the
++		 * search glyph and avatars as solid boxes. CA uploads them as
++		 * GL_RGBA, so call them 'RGBA'.
++		 */
++		if (s->pixelFormat == 0 && s->bytesPerElement == 4 && s->planeCount == 0) {
++			s->pixelFormat = 0x52474241;   /* 'RGBA' */
++		}
+ 		IOReturn pr = kIOReturnNoMemory;
+ 		s->memory = IOMemoryDescriptor::withAddressRange(ua, ulen, kIODirectionInOut, fTask);
+ 		if (s->memory != NULL && (pr = s->memory->prepare()) != kIOReturnSuccess) {
