@@ -683,7 +683,7 @@ e_TexSubImage2D(void *c, uint32_t target, int32_t level, int32_t x, int32_t y, i
  * host to read; upload its pixels through the ring instead (CA creates a
  * texture per image once, so this is not a per-frame copy).
  */
-static uint64_t g_wrap_seen;
+static uint64_t g_wrap_seen, g_tex_seen;
 
 static int
 tex_wrapped_surface(void *c, IOSurfaceRef s, const int32_t *v)
@@ -735,8 +735,10 @@ sweetgl_tex_iosurface(void *c, const int32_t *v)
 	if (v[8] != 0) {
 		IOSurfaceRef s = (IOSurfaceRef)(uintptr_t)((uint64_t)(uint32_t)v[8] << 32 | (uint32_t)v[0]);
 		in = IOSurfaceGetID(s);
-		sglog("texImageIOSurface %p id %llu %dx%d target 0x%x ifmt 0x%x fmt 0x%x type 0x%x plane %d pf 0x%x",
-		    (void *)s, (unsigned long long)in, v[3], v[4], v[1], v[2], v[5], v[6], v[7], (unsigned)IOSurfaceGetPixelFormat(s));
+		if (g_tex_seen++ < 16) {        /* one per texture: a registry call each under TCG */
+			sglog("texImageIOSurface %p id %llu %dx%d target 0x%x ifmt 0x%x fmt 0x%x type 0x%x plane %d pf 0x%x",
+			    (void *)s, (unsigned long long)in, v[3], v[4], v[1], v[2], v[5], v[6], v[7], (unsigned)IOSurfaceGetPixelFormat(s));
+		}
 		if (in == 0) {
 			(void)tex_wrapped_surface(c, s, v);
 			return;

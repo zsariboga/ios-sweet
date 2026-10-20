@@ -680,10 +680,15 @@ gliAttachDrawableWithOptions(void *ctx, int type, void *drawable, void *opts)
 EXPORT int
 gliSetInteger(void *ctx, uint32_t pname, const int32_t *v)
 {
+	static uint64_t seen;
+
 	if (pname == 0x38e && v != NULL) {
 		sweetgl_tex_iosurface(ctx, v);
 	}
-	sglog("gliSetInteger 0x%x = %d", pname, v != NULL ? v[0] : -1);
+	/* CA sets 0x399/0x38e around every IOSurface texture: each log line is a registry call under TCG */
+	if (seen++ < 16) {
+		sglog("gliSetInteger 0x%x = %d", pname, v != NULL ? v[0] : -1);
+	}
 	(void)ctx;
 	return 0;
 }
