@@ -1,0 +1,101 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4368bc6..135fe58 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -174,6 +174,8 @@ public:
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	uint32_t      fVsyncUS;       /* vsync period */
++	uint64_t      fVsyncAbs;      /* vsync period, absolute time units */
++	uint64_t      fVsyncNext;     /* ideal time of the next vsync */
+ 	bool          fScanout;       /* sweetfb_scanout: host reads the surface (sweet_scanout) */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -267,7 +269,9 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: direct scanout (sweet_scanout, %u segments max)\n", SWEET_SCANOUT_SEGS);
+ 	}
+ 	IOLog("SWEET FB: vsync %u Hz, panel copy every %u vsyncs\n", vhz, fFlushTicks);
+-	fVsync->setTimeoutUS(fVsyncUS);
++	nanoseconds_to_absolutetime((uint64_t)fVsyncUS * 1000, &fVsyncAbs);
++	fVsyncNext = mach_absolute_time() + fVsyncAbs;
++	fVsync->wakeAtTime((AbsoluteTime)fVsyncNext);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -282,11 +286,26 @@ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
++	/*
++	 * Phase-locked vsync: the next tick is due one period after the ideal
++	 * time of this one, armed before any work. Re-arming with a relative
++	 * timeout at the end (as before) added the handler's work (present())
++	 * and the timer latency to every period: ~23 ms, 43 Hz instead of 60,
++	 * and CoreAnimation saw uneven frame times. Late ticks skip ahead
++	 * instead of bunching up. CA gets the ideal tick time as timestamp.
++	 */
+ 	uint64_t now = mach_absolute_time();
++	uint64_t ideal = fb->fVsyncNext;
++	uint64_t next = ideal + fb->fVsyncAbs;
++	if (next <= now) {
++		next = ideal + ((now - ideal) / fb->fVsyncAbs + 1) * fb->fVsyncAbs;
++	}
++	fb->fVsyncNext = next;
++	sender->wakeAtTime((AbsoluteTime)next);
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+-		(uint32_t)now, (uint32_t)(now >> 32),
++		(uint32_t)ideal, (uint32_t)(ideal >> 32),
+ 		0, 0,
+ 	};
+ 
+@@ -324,7 +343,6 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(fb->fVsyncUS);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -341,7 +359,6 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(fb->fVsyncUS);
+ }
+ 
+ void
+@@ -399,7 +416,15 @@ AppleCLCD::present(const uint8_t *rec, bool copy)
+ 	uint32_t mask = get32(rec, 0x104);
+ 	/* Scanout needs exactly one enabled layer (the host shows one surface). */
+ 	bool scan = fScanout && !copy && __builtin_popcount(mask & 0xf) == 1;
++	/*
++	 * Several layers in scanout mode: the host cannot show them, and the CPU
++	 * copy into the panel memory (up to 4 x 11 MB inside the vsync handler)
++	 * only yields black for GPU-rendered surfaces. Skip it: the scanout goes
++	 * invalid and the host keeps its last frame (iOS16Viewer HoldGpu).
++	 */
++	bool multi = fScanout && !copy && __builtin_popcount(mask & 0xf) > 1;
+ 	bool published = false;
++	static uint32_t multi_logged;
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -431,6 +456,16 @@ AppleCLCD::present(const uint8_t *rec, bool copy)
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
++		if (multi) {
++			if (multi_logged < 40) {
++				multi_logged++;
++				IOLog("SWEET FB: multi-layer swap %u mask 0x%x layer %u surface %u %ux%u a %d,%d %ux%u b %d,%d %dx%d\n",
++				    get32(rec, 0x50), mask, layer, id, s ? s->width : 0, s ? s->height : 0, sx, sy,
++				    get32(a, 8), get32(a, 12), dx, dy, w, h);
++			}
++			OSSafeReleaseNULL(s);
++			continue;
++		}
+ 		if (s == NULL || s == fSurface) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
