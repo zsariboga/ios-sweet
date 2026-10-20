@@ -10,9 +10,12 @@
  *
  * This first version is a null driver: it accepts everything, returns
  * plausible values for queries, and logs (through the SweetAccel service,
- * into the kernel log) the first use of every GL entry point. It only reports
- * itself as usable when the kernel was booted with "sweetgl=1"; otherwise
- * gliGetVersion fails and EAGL/CoreAnimation keep the software path.
+ * into the kernel log) the first use of every GL entry point.
+ *
+ * Apple's GLEngine lives in the dyld shared cache, so dyld never loads a file
+ * at the original path; a dyld cache patch renames the path EAGL dlopens to
+ * GLEngine.bundle/SweetGL, which is this file. Booting with "sweetgl=0" makes
+ * gliGetVersion fail so EAGL/CoreAnimation keep the software path.
  */
 #include <stdint.h>
 #include <stdlib.h>
@@ -122,10 +125,12 @@ enabled(void)
 	if (g_enabled >= 0) {
 		return g_enabled;
 	}
-	g_enabled = 0;
+	/* On unless the kernel was booted with "sweetgl=0". The real switch is the dyld
+	 * cache patch that points EAGL at this file (tools/dsc-patches-gl.txt). */
+	g_enabled = 1;
 	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0) {
 		args[len] = 0;
-		g_enabled = strstr(args, "sweetgl=1") != NULL;
+		g_enabled = strstr(args, "sweetgl=0") == NULL;
 	}
 	return g_enabled;
 }
