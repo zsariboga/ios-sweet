@@ -1,0 +1,18 @@
+diff --git a/iokit/Kernel/arm/SweetAccel.cpp b/iokit/Kernel/arm/SweetAccel.cpp
+index 0db6c69..529046e 100644
+--- a/iokit/Kernel/arm/SweetAccel.cpp
++++ b/iokit/Kernel/arm/SweetAccel.cpp
+@@ -310,10 +310,12 @@ SweetAccelUserClient::describeSurface(IOExternalMethodArguments *args)
+ 	len = SWEET_GL_DESC_HDR + n * 16;
+ 	if (ret == kIOReturnSuccess) {
+ 		if (args->structureOutputDescriptor != NULL) {
++			/* A large struct output arrives as an unwired descriptor of the caller's buffer. */
+ 			if (len > args->structureOutputDescriptor->getLength()) {
+ 				ret = kIOReturnNoSpace;
+-			} else {
++			} else if ((ret = args->structureOutputDescriptor->prepare()) == kIOReturnSuccess) {
+ 				args->structureOutputDescriptor->writeBytes(0, buf, len);
++				args->structureOutputDescriptor->complete();
+ 				args->structureOutputDescriptorSize = len;
+ 			}
+ 		} else if (args->structureOutput != NULL && len <= args->structureOutputSize) {
