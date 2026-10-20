@@ -55,7 +55,41 @@ extern CFMutableDictionaryRef IOServiceMatching(const char *name);
 extern io_object_t IOServiceGetMatchingService(mach_port_t main, CFDictionaryRef matching);
 extern kern_return_t IORegistryEntrySetCFProperty(io_object_t entry, CFStringRef key, CFTypeRef value);
 
+extern kern_return_t IOServiceOpen(io_object_t service, task_port_t owning, uint32_t type, io_object_t *connect);
+
 static io_object_t g_accel;
+static kern_return_t g_log_kr;
+
+static io_object_t
+accel(void)
+{
+	if (g_accel == 0) {
+		g_accel = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("IOAcceleratorES"));
+	}
+	return g_accel;
+}
+
+/*
+ * Progress marker that needs no privilege: SweetAccel refuses every user
+ * client but logs "newUserClient type T from <proc>". T = 0x53470000 |
+ * stage << 12 | (last SweetGLLog kern_return & 0xfff).
+ */
+static void
+mark(unsigned stage)
+{
+	io_object_t conn = 0;
+
+	if (accel() != 0) {
+		(void)IOServiceOpen(g_accel, mach_task_self(), 0x53470000u | (stage & 0xf) << 12 |
+		    ((unsigned)g_log_kr & 0xfff), &conn);
+	}
+}
+
+__attribute__((constructor)) static void
+sweetgl_loaded(void)
+{
+	mark(1);
+}
 
 static void
 sglog(const char *fmt, ...)
@@ -65,11 +99,8 @@ sglog(const char *fmt, ...)
 	va_list ap;
 	CFStringRef s;
 
-	if (g_accel == 0) {
-		g_accel = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("IOAcceleratorES"));
-		if (g_accel == 0) {
-			return;
-		}
+	if (accel() == 0) {
+		return;
 	}
 	n = snprintf(buf, sizeof(buf), "%s[%d]: ", getprogname(), getpid());
 	va_start(ap, fmt);
@@ -77,7 +108,7 @@ sglog(const char *fmt, ...)
 	va_end(ap);
 	s = CFStringCreateWithCString(NULL, buf, kCFStringEncodingUTF8);
 	if (s != NULL) {
-		(void)IORegistryEntrySetCFProperty(g_accel, CFSTR("SweetGLLog"), s);
+		g_log_kr = IORegistryEntrySetCFProperty(g_accel, CFSTR("SweetGLLog"), s);
 		CFRelease(s);
 	}
 }
@@ -486,6 +517,7 @@ fill_dispatch(void **disp)
 EXPORT int
 gliInitializeLibrary(void *services, void *out, int count, int a3, uint32_t flags)
 {
+	mark(2);
 	sglog("gliInitializeLibrary services %p count %d flags 0x%x enabled %d",
 	    services, count, flags, enabled());
 	(void)out; (void)a3;
@@ -501,6 +533,7 @@ gliTerminateLibrary(void)
 EXPORT int
 gliGetVersion(uint32_t *a, void **p, uint32_t *c)
 {
+	mark(enabled() ? 3 : 4);
 	if (!enabled()) {
 		return 0;
 	}
@@ -532,6 +565,7 @@ gliChoosePixelFormat(void **out, const void *opts)
 	*(uint32_t *)(pf + 0x8) = 0x00010100;  /* driver ID */
 	*(uint32_t *)(pf + 0xc) = 0x00020100;  /* usable + ES3 */
 	*out = pf;
+	mark(5);
 	sglog("gliChoosePixelFormat -> %p", pf);
 	return 0;
 }
@@ -584,6 +618,7 @@ gliCreateContextWithShared(void **out, void *pf, void *shared, void **disp,
 		fill_dispatch(saved);
 	}
 	*out = ctx;
+	mark(6);
 	sglog("gliCreateContextWithShared ctx %p pf %p shared %p api 0x%x",
 	    ctx, pf, shared, api_flag);
 	return 0;
@@ -669,6 +704,7 @@ gliBindViewES(void *ctx, void *window, int retained, uint32_t format)
 	if (c != NULL) {
 		c->window = window;
 	}
+	mark(window != NULL ? 7 : 8);
 	return window != NULL;
 }
 
@@ -683,6 +719,9 @@ gliPresentViewES(void *ctx, int flags, double when)
 		return 0;
 	}
 	n = ++c->presents;
+	if (n == 1) {
+		mark(9);
+	}
 	if (n == 1 || n % 300 == 0) {
 		uint64_t total = 0;
 		int busiest = 0;
