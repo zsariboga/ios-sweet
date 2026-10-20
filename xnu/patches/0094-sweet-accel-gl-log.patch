@@ -1,0 +1,44 @@
+diff --git a/iokit/Kernel/arm/SweetAccel.cpp b/iokit/Kernel/arm/SweetAccel.cpp
+index 35a84ae..00445bc 100644
+--- a/iokit/Kernel/arm/SweetAccel.cpp
++++ b/iokit/Kernel/arm/SweetAccel.cpp
+@@ -23,6 +23,7 @@
+ extern "C" void proc_selfname(char *buf, int size);
+ 
+ #define SWEET_ACCEL_LOG_MAX 400
++#define SWEET_ACCEL_GL_LOG_MAX 20000
+ 
+ class IOAcceleratorES : public IOService {
+ 	OSDeclareDefaultStructors(IOAcceleratorES);
+@@ -33,6 +34,7 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ class SweetAccel : public IOAcceleratorES {
+ 	OSDeclareDefaultStructors(SweetAccel);
+ 	unsigned fLogged;
++	unsigned fGLLogged;
+ 	bool logOK(void);
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -88,9 +90,22 @@ SweetAccel::setProperties(OSObject *properties)
+ 	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+ 	OSCollectionIterator *it;
+ 	OSSymbol *key;
++	OSString *msg;
+ 	char name[32];
+ 
+-	if (dict == NULL || !logOK()) {
++	if (dict == NULL) {
++		return kIOReturnSuccess;
++	}
++	/* The SweetGL GLEngine (userland, no /dev/console access) logs here. */
++	msg = OSDynamicCast(OSString, dict->getObject("SweetGLLog"));
++	if (msg != NULL) {
++		if (fGLLogged < SWEET_ACCEL_GL_LOG_MAX) {
++			fGLLogged++;
++			IOLog("SWEETGL %s\n", msg->getCStringNoCopy());
++		}
++		return kIOReturnSuccess;
++	}
++	if (!logOK()) {
+ 		return kIOReturnSuccess;
+ 	}
+ 	proc_selfname(name, sizeof(name));

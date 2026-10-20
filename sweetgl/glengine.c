@@ -9,8 +9,8 @@
  * See research/eagl-minimal.md and research/gl-dispatch-slots.txt.
  *
  * This first version is a null driver: it accepts everything, returns
- * plausible values for queries, and logs (to /dev/console, which lands in
- * the kernel log) the first use of every GL entry point. It only reports
+ * plausible values for queries, and logs (through the SweetAccel service,
+ * into the kernel log) the first use of every GL entry point. It only reports
  * itself as usable when the kernel was booted with "sweetgl=1"; otherwise
  * gliGetVersion fails and EAGL/CoreAnimation keep the software path.
  */
@@ -22,6 +22,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 #define SWEETGL_NSLOTS 1036
 #define EXPORT __attribute__((visibility("default")))
@@ -36,7 +38,6 @@ typedef struct sweetgl_ctx {
 	uint64_t presents;
 } sweetgl_ctx;
 
-static int g_console = -1;
 static int g_enabled = -1;
 static uint32_t g_next_name = 1;
 static uint8_t g_seen[SWEETGL_NSLOTS];
@@ -44,28 +45,41 @@ static uint64_t g_calls[SWEETGL_NSLOTS];
 static void *g_map_buffer;
 static uint8_t g_version_blob[256];
 
+/*
+ * Log channel: GL clients (backboardd runs as mobile) cannot open
+ * /dev/console, so messages go to the SweetAccel IOAcceleratorES service as a
+ * "SweetGLLog" property; the kernel (patch 0094) prints them as "SWEETGL ...".
+ */
+typedef mach_port_t io_object_t;
+extern CFMutableDictionaryRef IOServiceMatching(const char *name);
+extern io_object_t IOServiceGetMatchingService(mach_port_t main, CFDictionaryRef matching);
+extern kern_return_t IORegistryEntrySetCFProperty(io_object_t entry, CFStringRef key, CFTypeRef value);
+
+static io_object_t g_accel;
+
 static void
 sglog(const char *fmt, ...)
 {
-	char buf[256];
+	char buf[240];
 	int n;
 	va_list ap;
+	CFStringRef s;
 
-	if (g_console < 0) {
-		g_console = open("/dev/console", O_WRONLY | O_NOCTTY);
-		if (g_console < 0) {
+	if (g_accel == 0) {
+		g_accel = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("IOAcceleratorES"));
+		if (g_accel == 0) {
 			return;
 		}
 	}
-	n = snprintf(buf, sizeof(buf), "SWEETGL %s[%d]: ", getprogname(), getpid());
+	n = snprintf(buf, sizeof(buf), "%s[%d]: ", getprogname(), getpid());
 	va_start(ap, fmt);
-	n += vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+	vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
 	va_end(ap);
-	if (n > (int)sizeof(buf) - 2) {
-		n = sizeof(buf) - 2;
+	s = CFStringCreateWithCString(NULL, buf, kCFStringEncodingUTF8);
+	if (s != NULL) {
+		(void)IORegistryEntrySetCFProperty(g_accel, CFSTR("SweetGLLog"), s);
+		CFRelease(s);
 	}
-	buf[n++] = '\n';
-	(void)write(g_console, buf, n);
 }
 
 static int
