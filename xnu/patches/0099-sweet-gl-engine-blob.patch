@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetAccel.cpp b/iokit/Kernel/arm/SweetAccel.cpp
-index 529046e..e4355e9 100644
+index 529046e..3040973 100644
 --- a/iokit/Kernel/arm/SweetAccel.cpp
 +++ b/iokit/Kernel/arm/SweetAccel.cpp
 @@ -40,6 +40,8 @@ extern "C" int proc_selfpid(void);
@@ -72,7 +72,7 @@ index 529046e..e4355e9 100644
  bool
  SweetAccelUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
  {
-@@ -376,7 +418,23 @@ SweetAccel::start(IOService *provider)
+@@ -376,7 +418,21 @@ SweetAccel::start(IOService *provider)
  		sweet_gl_lock = IOLockAlloc();
  	}
  	sweet_gl.magic = SWEET_GL_TABLE_MAGIC;
@@ -87,17 +87,15 @@ index 529046e..e4355e9 100644
 +			sweet_gl.blob_size = SWEET_GL_BLOB_SIZE;
 +			__builtin_arm_dmb(0xb);
 +			sweet_gl.blob_pa = sweet_gl_blob->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
-+			IOLog("SWEET GL: engine blob %u MB at 0x%llx
-+", SWEET_GL_BLOB_SIZE >> 20, sweet_gl.blob_pa);
++			IOLog("SWEET GL: engine blob %u MB at 0x%llx\n", SWEET_GL_BLOB_SIZE >> 20, sweet_gl.blob_pa);
 +		} else {
-+			IOLog("SWEET GL: no contiguous %u MB engine blob
-+", SWEET_GL_BLOB_SIZE >> 20);
++			IOLog("SWEET GL: no contiguous %u MB engine blob\n", SWEET_GL_BLOB_SIZE >> 20);
 +		}
 +	}
  	for (int i = 0; i < SWEET_GL_PREALLOC; i++) {
  		if (sweet_gl_pool[i] == NULL) {
  			sweet_gl_pool[i] = sweet_gl_alloc_ring();
-@@ -398,6 +456,23 @@ SweetAccel::newUserClient(task_t owningTask, void *securityID,
+@@ -398,6 +454,23 @@ SweetAccel::newUserClient(task_t owningTask, void *securityID,
  {
  	char name[32];
  
