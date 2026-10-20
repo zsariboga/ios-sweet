@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetAccel.cpp b/iokit/Kernel/arm/SweetAccel.cpp
-index 00445bc..12aff4d 100644
+index 00445bc..a20c434 100644
 --- a/iokit/Kernel/arm/SweetAccel.cpp
 +++ b/iokit/Kernel/arm/SweetAccel.cpp
 @@ -6,9 +6,9 @@
@@ -74,7 +74,7 @@ index 00445bc..12aff4d 100644
  
  #define SWEET_ACCEL_LOG_MAX 400
  #define SWEET_ACCEL_GL_LOG_MAX 20000
-@@ -31,6 +81,209 @@ class IOAcceleratorES : public IOService {
+@@ -31,6 +81,212 @@ class IOAcceleratorES : public IOService {
  
  OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
  
@@ -185,7 +185,7 @@ index 00445bc..12aff4d 100644
 +/*
 + * Selector 0: scalar in [surface id] -> struct out: 12 u32 (id, width, height,
 + * bytesPerRow, offset, pixelFormat, allocSize, nseg, planeCount,
-+ * bytesPerElement, 0, 0) then nseg (pa, len) u64 pairs covering the
++ * bytesPerElement, seed, 0) then nseg (pa, len) u64 pairs covering the
 + * surface memory from offset 0 (contiguous pages merged).
 + */
 +IOReturn
@@ -247,6 +247,9 @@ index 00445bc..12aff4d 100644
 +	h[7] = n;
 +	h[8] = s->planeCount;
 +	h[9] = s->bytesPerElement;
++	if (s->state != NULL) {         /* seed: bumped on every unlock (content changed) */
++		h[10] = *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc);
++	}
 +	s->release();
 +	len = SWEET_GL_DESC_HDR + n * 16;
 +	if (ret == kIOReturnSuccess) {
@@ -284,7 +287,7 @@ index 00445bc..12aff4d 100644
  class SweetAccel : public IOAcceleratorES {
  	OSDeclareDefaultStructors(SweetAccel);
  	unsigned fLogged;
-@@ -61,6 +314,11 @@ SweetAccel::start(IOService *provider)
+@@ -61,6 +317,11 @@ SweetAccel::start(IOService *provider)
  	if (!IOService::start(provider)) {
  		return false;
  	}
@@ -296,7 +299,7 @@ index 00445bc..12aff4d 100644
  	setProperty("SweetAccel", true);
  	registerService();
  	IOLog("SWEET ACCEL: IOAcceleratorES stub registered\n");
-@@ -73,14 +331,28 @@ SweetAccel::newUserClient(task_t owningTask, void *securityID,
+@@ -73,14 +334,28 @@ SweetAccel::newUserClient(task_t owningTask, void *securityID,
  {
  	char name[32];
  

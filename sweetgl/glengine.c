@@ -36,6 +36,7 @@ extern const char *const sweetgl_slot_name[SWEETGL_NSLOTS];
 
 typedef struct sweetgl_ctx {
 	uint32_t magic;
+	uint32_t id;            /* context id on the wire (SGL_CONTEXT) */
 	uint32_t api_flag;
 	void *window;
 	uint64_t presents;
@@ -62,6 +63,9 @@ extern kern_return_t IOServiceOpen(io_object_t service, task_port_t owning, uint
 
 static io_object_t g_accel;
 static kern_return_t g_log_kr;
+
+io_object_t
+sweetgl_accel(void);
 
 static io_object_t
 accel(void)
@@ -94,7 +98,7 @@ sweetgl_loaded(void)
 	mark(1);
 }
 
-static void
+void
 sglog(const char *fmt, ...)
 {
 	char buf[240];
@@ -152,8 +156,8 @@ sweetgl_hit(int slot)
 	return 0;
 }
 
-static int
-slot_of(const char *name)
+int
+sweetgl_slot_of(const char *name)
 {
 	for (int i = 0; i < SWEETGL_NSLOTS; i++) {
 		if (strcmp(sweetgl_slot_name[i], name) == 0) {
@@ -165,7 +169,7 @@ slot_of(const char *name)
 
 #define SEEN(name) do { \
 	static int s_slot = -2; \
-	if (s_slot == -2) s_slot = slot_of(name); \
+	if (s_slot == -2) s_slot = sweetgl_slot_of(name); \
 	if (s_slot >= 0) sweetgl_hit(s_slot); \
 } while (0)
 
@@ -505,16 +509,34 @@ static const struct {
 	{ "glGetInternalformativ", (void *)gl_GetInternalformativ },
 };
 
+/* encoder.c */
+extern void sweetgl_encoder_fill(void **disp);
+extern void sweetgl_tex_iosurface(void *ctx, const int32_t *v);
+extern void sweetgl_delete_context(uint32_t id);
+
+io_object_t
+sweetgl_accel(void)
+{
+	return accel();
+}
+
+uint32_t
+sweetgl_context_id(void *ctx)
+{
+	return ctx != NULL ? ((sweetgl_ctx *)ctx)->id : 0;
+}
+
 static void
 fill_dispatch(void **disp)
 {
 	memcpy(disp, sweetgl_default, sizeof(void *) * SWEETGL_NSLOTS);
 	for (size_t i = 0; i < sizeof(k_special) / sizeof(k_special[0]); i++) {
-		int s = slot_of(k_special[i].name);
+		int s = sweetgl_slot_of(k_special[i].name);
 		if (s >= 0) {
 			disp[s] = k_special[i].fn;
 		}
 	}
+	sweetgl_encoder_fill(disp);
 }
 
 /* ---- GLI interface used by EAGL ---- */
@@ -617,6 +639,7 @@ gliCreateContextWithShared(void **out, void *pf, void *shared, void **disp,
 		return 10000;
 	}
 	ctx->magic = 0x53474c31; /* SGL1 */
+	ctx->id = next_name();
 	ctx->api_flag = api_flag;
 	fill_dispatch(disp);
 	if (saved != NULL) {
@@ -632,6 +655,9 @@ gliCreateContextWithShared(void **out, void *pf, void *shared, void **disp,
 EXPORT int
 gliDestroyContext(void *ctx)
 {
+	if (ctx != NULL) {
+		sweetgl_delete_context(((sweetgl_ctx *)ctx)->id);
+	}
 	sglog("gliDestroyContext %p", ctx);
 	free(ctx);
 	return 0;
@@ -654,6 +680,9 @@ gliAttachDrawableWithOptions(void *ctx, int type, void *drawable, void *opts)
 EXPORT int
 gliSetInteger(void *ctx, uint32_t pname, const int32_t *v)
 {
+	if (pname == 0x38e && v != NULL) {
+		sweetgl_tex_iosurface(ctx, v);
+	}
 	sglog("gliSetInteger 0x%x = %d", pname, v != NULL ? v[0] : -1);
 	(void)ctx;
 	return 0;
