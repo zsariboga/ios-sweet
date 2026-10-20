@@ -1,0 +1,123 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e20073f..c494c82 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -37,6 +37,8 @@
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSSymbol.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
+ 
+@@ -73,6 +75,7 @@ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
++static uint32_t sweet_surface_keys_logged, sweet_surface_addr_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+@@ -102,7 +105,7 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache | (clientWired ? kIOMapReadOnly : 0));
++		kernelMap = memory->map(kIOMapWriteCombineCache | (clientReadOnly ? kIOMapReadOnly : 0));
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -534,7 +537,7 @@ IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool
+ 	ref->count = 1;
+ 	/* wrapped client images may be read-only pages (patch 0101): map them read-only */
+ 	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache |
+-	    (s->clientWired ? kIOMapReadOnly : 0));
++	    (s->clientReadOnly ? kIOMapReadOnly : 0));
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+ 		ref->release();
+@@ -696,7 +699,60 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	OSNumber *uaddr = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	if (sweet_surface_keys_logged < 6 && props->getCount() >= 8) {
++		/* which keys CoreAnimation's image surfaces carry (patch 0102) */
++		char keys[256];
++		size_t at = 0;
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
++		OSSymbol *k;
++		keys[0] = 0;
++		while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL && at < sizeof(keys) - 2) {
++			at += strlcpy(keys + at, k->getCStringNoCopy(), sizeof(keys) - at);
++			if (at < sizeof(keys) - 2) {
++				keys[at++] = ' ';
++				keys[at] = 0;
++			}
++		}
++		OSSafeReleaseNULL(it);
++		sweet_surface_keys_logged++;
++		IOLog("SWEET SURF: create keys: %s\n", keys);
++	}
++	if (ret == kIOReturnSuccess && uaddr != NULL && uaddr->unsigned64BitValue() != 0) {
++		/*
++		 * IOSurfaceAddress (patch 0102): a surface over the caller's memory
++		 * (CoreAnimation's decoded images, e.g. home screen icons). Allocating
++		 * fresh memory here left those surfaces empty. Wire the range for the
++		 * host to read; read-only pages fall back to a read-only wiring.
++		 */
++		uint64_t ua = uaddr->unsigned64BitValue();
++		uint64_t ulen = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++		uint64_t need = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++		if (ulen < need) {
++			ulen = need;
++		}
++		IOReturn pr = kIOReturnNoMemory;
++		s->memory = IOMemoryDescriptor::withAddressRange(ua, ulen, kIODirectionInOut, fTask);
++		if (s->memory != NULL && (pr = s->memory->prepare()) != kIOReturnSuccess) {
++			OSSafeReleaseNULL(s->memory);
++			s->memory = IOMemoryDescriptor::withAddressRange(ua, ulen, kIODirectionOut, fTask);
++			s->clientReadOnly = true;
++			pr = s->memory != NULL ? s->memory->prepare() : kIOReturnNoMemory;
++		}
++		if (pr == kIOReturnSuccess) {   /* completed by free() */
++			s->clientWired = true;
++			s->mapCache = kIOMapDefaultCache;
++			ret = sweet_surface_publish(s) ? kIOReturnSuccess : kIOReturnNoResources;
++		} else {
++			OSSafeReleaseNULL(s->memory);
++			ret = kIOReturnVMError;
++		}
++		if (ret != kIOReturnSuccess || sweet_surface_addr_logged < 16) {
++			sweet_surface_addr_logged++;
++			IOLog("SWEET SURF: create id %u over client 0x%llx len %llu%s -> 0x%x (prepare 0x%x)\n",
++			    s->id, ua, ulen, s->clientReadOnly ? " read-only" : "", ret, pr);
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+@@ -809,6 +865,7 @@ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
+ 	}
+ 	if (pr == kIOReturnSuccess) {     /* completed by free() */
+ 		s->clientWired = true;
++		s->clientReadOnly = true;
+ 		ret = sweet_surface_publish(s) ? kIOReturnSuccess : kIOReturnNoResources;
+ 	}
+ 	if (ret != kIOReturnSuccess) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index ee53a80..9743366 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,7 +39,8 @@ public:
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+-	bool                      clientWired;  /* memory is a prepared client range (WrapClientImage) */
++	bool                      clientWired;  /* memory is a prepared client range (WrapClientImage, IOSurfaceAddress) */
++	bool                      clientReadOnly; /* ... wired for reading only: map it read-only */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
