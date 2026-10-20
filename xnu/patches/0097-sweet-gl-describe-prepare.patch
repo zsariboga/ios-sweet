@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetAccel.cpp b/iokit/Kernel/arm/SweetAccel.cpp
+index 32cdfe7..0db6c69 100644
+--- a/iokit/Kernel/arm/SweetAccel.cpp
++++ b/iokit/Kernel/arm/SweetAccel.cpp
+@@ -264,6 +264,12 @@ SweetAccelUserClient::describeSurface(IOExternalMethodArguments *args)
+ 	seg = (uint64_t *)(buf + SWEET_GL_DESC_HDR);
+ 	maxseg = (SWEET_GL_DESC_MAX - SWEET_GL_DESC_HDR) / 16;
+ 	size = s->memory->getLength();
++	/* getPhysicalSegment panics ("IOGMD: not wired") on a descriptor nobody prepared. */
++	if (s->memory->prepare() != kIOReturnSuccess) {
++		IOFreeData(buf, SWEET_GL_DESC_MAX);
++		s->release();
++		return kIOReturnVMError;
++	}
+ 	while (off < size) {
+ 		IOByteCount slen = 0;
+ 		addr64_t pa = s->memory->getPhysicalSegment(off, &slen, kIOMemoryMapperNone);
+@@ -286,6 +292,7 @@ SweetAccelUserClient::describeSurface(IOExternalMethodArguments *args)
+ 		}
+ 		off += slen;
+ 	}
++	s->memory->complete();
+ 	h[0] = s->id;
+ 	h[1] = s->width;
+ 	h[2] = s->height;
