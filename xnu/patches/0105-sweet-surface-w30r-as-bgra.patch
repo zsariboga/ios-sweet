@@ -1,0 +1,20 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0fc4bbd..6d1d7ed 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -295,6 +295,15 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
+ 	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
+ 	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	if (s->pixelFormat == 0x77333072 && s->bytesPerElement == 4) {
++		/*
++		 * 'w30r' (10-bit extended range, SpringBoard's wallpaper): EAGL
++		 * has no GL mapping for it ("Unsupported IOSurface format") and
++		 * the wallpaper stayed black. Same size per pixel as 'BGRA';
++		 * the CPU renderer follows the surface's format.
++		 */
++		s->pixelFormat = 0x42475241;   /* 'BGRA' */
++	}
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
