@@ -182,6 +182,17 @@ sweetgl_loader(void)
 	int missing = 0;
 
 	map_blob();
+	/*
+	 * Never unload: EAGL dlcloses the renderer when its last context goes
+	 * (Preferences: CoreImage scaling app icons), and the watcher thread then
+	 * returned from sleep() into unmapped memory that CoreAnimation had
+	 * reused (SIGBUS, "Data/Stack execution not permitted", pc watcher+0x2c).
+	 */
+	Dl_info self;
+	if (dladdr((const void *)sweetgl_loader, &self) == 0 || self.dli_fname == NULL ||
+	    dlopen(self.dli_fname, RTLD_NOLOAD | RTLD_NODELETE) == NULL) {
+		lg("cannot pin the loader: %s", dlerror());
+	}
 	from = blob_engine(path, sizeof(path));
 	if (from != NULL) {
 		h = dlopen(from, RTLD_NOW | RTLD_LOCAL);
