@@ -9,7 +9,8 @@ ws=${GITHUB_WORKSPACE:-}
 if bash "$ws/sweetgl/build.sh"; then
     mkdir -p "$ws/out"
     cp "$ws/sweetgl/out/GLEngine" "$ws/out/GLEngine"
-    (cd "$ws/out" && shasum -a 256 GLEngine > GLEngine.sha256)
+    cp "$ws/sweetgl/out/SweetGL" "$ws/out/SweetGL" || true
+    (cd "$ws/out" && shasum -a 256 GLEngine SweetGL > GLEngine.sha256)
     echo "SweetGL GLEngine built"
 else
     echo "SweetGL GLEngine build FAILED (kernel build continues)" >&2

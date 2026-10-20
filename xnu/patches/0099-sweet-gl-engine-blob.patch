@@ -1,0 +1,123 @@
+diff --git a/iokit/Kernel/arm/SweetAccel.cpp b/iokit/Kernel/arm/SweetAccel.cpp
+index 529046e..e4355e9 100644
+--- a/iokit/Kernel/arm/SweetAccel.cpp
++++ b/iokit/Kernel/arm/SweetAccel.cpp
+@@ -40,6 +40,8 @@ extern "C" int proc_selfpid(void);
+ #define SWEET_GL_RING_MAGIC     0x51474c53u     /* 'SGLQ' */
+ #define SWEET_GL_RINGS          8
+ #define SWEET_GL_RING_SIZE      (32u << 20)
++#define SWEET_GL_BLOB_TYPE      0x53474c42u     /* 'SGLB' */
++#define SWEET_GL_BLOB_SIZE      (8u << 20)
+ #define SWEET_GL_DESC_HDR       48
+ #define SWEET_GL_DESC_MAX       65536
+ 
+@@ -57,6 +59,14 @@ struct sweet_gl_table {
+ 	uint32_t nrings;
+ 	uint32_t pad;
+ 	struct sweet_gl_ring_rec ring[SWEET_GL_RINGS];
++	/*
++	 * Version 2 (patch 0099): the engine blob. The host writes a SweetGL engine
++	 * build here; the loader in GLEngine.bundle/SweetGL maps it (type 'SGLB')
++	 * and reloads its process when the blob's generation changes, so a new
++	 * engine needs no reboot. The blob layout belongs to host and loader.
++	 */
++	uint64_t blob_pa;
++	uint64_t blob_size;
+ };
+ struct sweet_gl_table sweet_gl;
+ }
+@@ -73,6 +83,7 @@ static IOLock *sweet_gl_lock;
+ #define SWEET_GL_RING_MIN       (4u << 20)
+ 
+ static IOBufferMemoryDescriptor *sweet_gl_pool[SWEET_GL_RINGS];
++static IOBufferMemoryDescriptor *sweet_gl_blob;
+ static bool sweet_gl_busy[SWEET_GL_RINGS];
+ 
+ static IOBufferMemoryDescriptor *
+@@ -132,6 +143,37 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetAccelUserClient, IOUserClient);
+ 
++/* Type 'SGLB': maps the engine blob (memory type 0), nothing else. */
++class SweetBlobUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetBlobUserClient);
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
++	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetBlobUserClient, IOUserClient);
++
++IOReturn
++SweetBlobUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetBlobUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
++    IOMemoryDescriptor **memory)
++{
++	if (type != 0 || sweet_gl_blob == NULL) {
++		return kIOReturnBadArgument;
++	}
++	sweet_gl_blob->retain();
++	*memory = sweet_gl_blob;
++	*options = 0;
++	return kIOReturnSuccess;
++}
++
+ bool
+ SweetAccelUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -376,7 +418,23 @@ SweetAccel::start(IOService *provider)
+ 		sweet_gl_lock = IOLockAlloc();
+ 	}
+ 	sweet_gl.magic = SWEET_GL_TABLE_MAGIC;
+-	sweet_gl.version = 1;
++	sweet_gl.version = 2;
++	if (sweet_gl_blob == NULL) {
++		sweet_gl_blob = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared,
++		    SWEET_GL_BLOB_SIZE, 0x0000fffffffff000ULL);
++		if (sweet_gl_blob != NULL) {
++			bzero(sweet_gl_blob->getBytesNoCopy(), page_size);
++			sweet_gl.blob_size = SWEET_GL_BLOB_SIZE;
++			__builtin_arm_dmb(0xb);
++			sweet_gl.blob_pa = sweet_gl_blob->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++			IOLog("SWEET GL: engine blob %u MB at 0x%llx
++", SWEET_GL_BLOB_SIZE >> 20, sweet_gl.blob_pa);
++		} else {
++			IOLog("SWEET GL: no contiguous %u MB engine blob
++", SWEET_GL_BLOB_SIZE >> 20);
++		}
++	}
+ 	for (int i = 0; i < SWEET_GL_PREALLOC; i++) {
+ 		if (sweet_gl_pool[i] == NULL) {
+ 			sweet_gl_pool[i] = sweet_gl_alloc_ring();
+@@ -398,6 +456,23 @@ SweetAccel::newUserClient(task_t owningTask, void *securityID,
+ {
+ 	char name[32];
+ 
++	if (type == SWEET_GL_BLOB_TYPE) {
++		SweetBlobUserClient *bc = OSTypeAlloc(SweetBlobUserClient);
++		if (bc == NULL) {
++			return kIOReturnNoMemory;
++		}
++		if (!bc->initWithTask(owningTask, securityID, type) || !bc->attach(this)) {
++			bc->release();
++			return kIOReturnNoResources;
++		}
++		if (!bc->start(this)) {
++			bc->detach(this);
++			bc->release();
++			return kIOReturnNoResources;
++		}
++		*handler = bc;
++		return kIOReturnSuccess;
++	}
+ 	if (type == SWEET_GL_TYPE && sweet_gl_lock != NULL) {
+ 		SweetAccelUserClient *uc = OSTypeAlloc(SweetAccelUserClient);
+ 		if (uc == NULL) {
