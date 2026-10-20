@@ -694,6 +694,7 @@ tex_wrapped_surface(void *c, IOSurfaceRef s, const int32_t *v)
 	int32_t saved_row, saved_al, saved_sr, saved_sp;
 
 	if (base == NULL || bpp == 0 || bpr % bpp != 0) {
+		sglog("wrapped surface %p %dx%d: base %p bpr %zu bpp %u, not uploaded", (void *)s, v[3], v[4], base, bpr, bpp);
 		return 0;
 	}
 	if (g_wrap_seen++ < 8) {
@@ -734,6 +735,8 @@ sweetgl_tex_iosurface(void *c, const int32_t *v)
 	if (v[8] != 0) {
 		IOSurfaceRef s = (IOSurfaceRef)(uintptr_t)((uint64_t)(uint32_t)v[8] << 32 | (uint32_t)v[0]);
 		in = IOSurfaceGetID(s);
+		sglog("texImageIOSurface %p id %llu %dx%d target 0x%x ifmt 0x%x fmt 0x%x type 0x%x plane %d pf 0x%x",
+		    (void *)s, (unsigned long long)in, v[3], v[4], v[1], v[2], v[5], v[6], v[7], (unsigned)IOSurfaceGetPixelFormat(s));
 		if (in == 0) {
 			(void)tex_wrapped_surface(c, s, v);
 			return;
@@ -746,6 +749,7 @@ sweetgl_tex_iosurface(void *c, const int32_t *v)
 	}
 	kr = IOConnectCallMethod(g_conn, 0, &in, 1, NULL, 0, NULL, NULL, g_desc, &dlen);
 	if (kr != KERN_SUCCESS) {
+		sglog("describe surface %llu: 0x%x", (unsigned long long)in, kr);
 		dlen = 0;
 	}
 	p = cmd_begin(SGL_TEX_IOSURFACE, (uint32_t)(sizeof(struct sgl_tex_iosurface) + dlen));
